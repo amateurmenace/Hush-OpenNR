@@ -23,7 +23,6 @@ add_library(OpenNR MODULE
     ${SUPPORT}/ofxsCore.cpp
     ${SUPPORT}/ofxsImageEffect.cpp
     ${SUPPORT}/ofxsInteract.cpp
-    ${SUPPORT}/ofxsHWNDInteract.cpp
     ${SUPPORT}/ofxsLog.cpp
     ${SUPPORT}/ofxsMultiThread.cpp
     ${SUPPORT}/ofxsParams.cpp
