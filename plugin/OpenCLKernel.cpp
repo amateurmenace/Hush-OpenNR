@@ -70,6 +70,11 @@ typedef struct NRParams
     float lockTC;
     float lockGainY[16];
     float lockGainC[16];
+
+    float detailRescue;
+    int   scopeMeasure;
+    int   scopeMotion;
+    int   scopeEq;
 } NRParams;
 
 #define kMedianCal   0.247100f
@@ -111,6 +116,9 @@ typedef struct NRParams
 #define S_GY    4136
 #define S_GC    4152
 #define S_ENMED 4168
+#define S_FINEY 4169
+#define S_FINEC 4170
+#define S_CRSY  4171
 
 inline float smooth01f(float t)
 {
@@ -281,6 +289,10 @@ __kernel void NoiseEstKernel(NRParams p, int W, int H,
     const float lapCb = 4.0f * Cb[4] - 2.0f * (Cb[1] + Cb[3] + Cb[5] + Cb[7]) + (Cb[0] + Cb[2] + Cb[6] + Cb[8]);
     const float lapCr = 4.0f * Cr[4] - 2.0f * (Cr[1] + Cr[3] + Cr[5] + Cr[7]) + (Cr[0] + Cr[2] + Cr[6] + Cr[8]);
 
+    // v3.1: exactly-flat samples carry no noise evidence — skip entirely
+    if (lapY == 0.0f && lapCb == 0.0f && lapCr == 0.0f)
+        return;
+
     atomic_inc(&stats[H_YF + clamp((int)(fabs(lapY)  * kHistScaleY), 0, kHistBins - 1)]);
     atomic_inc(&stats[H_CF + clamp((int)(fabs(lapCb) * kHistScaleC), 0, kHistBins - 1)]);
     atomic_inc(&stats[H_CF + clamp((int)(fabs(lapCr) * kHistScaleC), 0, kHistBins - 1)]);
@@ -308,9 +320,11 @@ __kernel void NoiseEstKernel(NRParams p, int W, int H,
         const float lY  = 4.0f * bY[4]  - 2.0f * (bY[1] + bY[3] + bY[5] + bY[7])   + (bY[0] + bY[2] + bY[6] + bY[8]);
         const float lCb = 4.0f * bCb[4] - 2.0f * (bCb[1] + bCb[3] + bCb[5] + bCb[7]) + (bCb[0] + bCb[2] + bCb[6] + bCb[8]);
         const float lCr = 4.0f * bCr[4] - 2.0f * (bCr[1] + bCr[3] + bCr[5] + bCr[7]) + (bCr[0] + bCr[2] + bCr[6] + bCr[8]);
-        atomic_inc(&stats[H_Y2 + clamp((int)(fabs(lY)  * kHistScaleY), 0, kHistBins - 1)]);
-        atomic_inc(&stats[H_C2 + clamp((int)(fabs(lCb) * kHistScaleC), 0, kHistBins - 1)]);
-        atomic_inc(&stats[H_C2 + clamp((int)(fabs(lCr) * kHistScaleC), 0, kHistBins - 1)]);
+        if (lY != 0.0f || lCb != 0.0f || lCr != 0.0f) {  // v3.1 flat-sample skip
+            atomic_inc(&stats[H_Y2 + clamp((int)(fabs(lY)  * kHistScaleY), 0, kHistBins - 1)]);
+            atomic_inc(&stats[H_C2 + clamp((int)(fabs(lCb) * kHistScaleC), 0, kHistBins - 1)]);
+            atomic_inc(&stats[H_C2 + clamp((int)(fabs(lCr) * kHistScaleC), 0, kHistBins - 1)]);
+        }
     }
 }
 
@@ -350,6 +364,7 @@ __kernel void FinalizeStatsKernel(NRParams p, __global uint* stats)
     float sc = clamp(p.sigmaC, kSigmaMin, kSigmaMax);
     float ty = sy, tc = sc;
     uint medBin = 0;
+    float fineYv = sy, fineCv = sc, coarseYv = sy;   // v3.1: per-band (EQ scope)
 
     float gy[16], gc[16];
     for (int b = 0; b < 16; ++b) { gy[b] = 1.0f; gc[b] = 1.0f; }
@@ -361,6 +376,7 @@ __kernel void FinalizeStatsKernel(NRParams p, __global uint* stats)
         const float scFine = histQuantile(stats, H_CF, kHistBins, totalF * 2, kHistScaleC, 1, 2).value * kMedianCal;
         const float syCoarse = 2.0f * histQuantile(stats, H_Y2, kHistBins, total2, kHistScaleY, 1, 2).value * kMedianCal;
         const float scCoarse = 2.0f * histQuantile(stats, H_C2, kHistBins, total2 * 2, kHistScaleC, 1, 2).value * kMedianCal;
+        fineYv = syFine; fineCv = scFine; coarseYv = syCoarse;
 
         const float lapSY = fmax(syFine, 0.9f * syCoarse);
         const float lapSC = fmax(scFine, 0.9f * scCoarse);
@@ -378,7 +394,7 @@ __kernel void FinalizeStatsKernel(NRParams p, __global uint* stats)
             if (candC > 0.0015f && candC <= 3.5f * lapSC) tc = candC;
         }
 
-        const float adj = clamp(p.profileAdjust, 0.25f, 4.0f);
+        const float adj = clamp(p.profileAdjust, 0.25f, 6.0f);
         sy = clamp(fmax(lapSY, 0.85f * ty) * adj, kSigmaMin, kSigmaMax);
         sc = clamp(fmax(lapSC, 0.85f * tc) * adj, kSigmaMin, kSigmaMax);
         ty = clamp(ty * adj, kSigmaMin, kSigmaMax);
@@ -417,6 +433,10 @@ __kernel void FinalizeStatsKernel(NRParams p, __global uint* stats)
     stats[S_TC] = as_uint(tc);
     stats[S_MED] = medBin;
     stats[S_HMAX] = hmax;
+    // v3.1: raw per-band estimates for the EQ scope (never lock-overridden)
+    stats[S_FINEY] = as_uint(fineYv);
+    stats[S_FINEC] = as_uint(fineCv);
+    stats[S_CRSY]  = as_uint(coarseYv);
     for (int b = 0; b < kLumaBins; ++b) {
         const int b0 = clamp(b - 1, 0, kLumaBins - 1);
         const int b1 = clamp(b + 1, 0, kLumaBins - 1);
@@ -451,9 +471,10 @@ __kernel void TemporalKernel(NRParams p, int W, int H,
     const float4 sig = loadSigmasIn(p, stats);
     const float mLow  = fmin(p.master, 1.0f);
     const float mHigh = fmax(p.master, 1.0f);
-    const float tL = clamp(p.temporalLuma   * mLow, 0.0f, 1.0f);
-    const float tC = clamp(p.temporalChroma * mLow, 0.0f, 1.0f);
-    const float thrMul = 0.4f + 2.6f * clamp(p.motionThresh, 0.0f, 1.0f)
+    // v3.1: sliders reach 125 — a matching neighbour may outweigh the centre
+    const float tL = clamp(p.temporalLuma   * mLow, 0.0f, 1.25f);
+    const float tC = clamp(p.temporalChroma * mLow, 0.0f, 1.25f);
+    const float thrMul = 0.4f + 2.6f * clamp(p.motionThresh, 0.0f, 1.5f)
                        + 0.8f * (mHigh - 1.0f);
     const int reach = (p.enableTemporal == 0) ? 0 : ((p.temporalFrames >= 5) ? 2 : 1);
     const float loY = kAbsDiffBias * sig.z, hiY = loY + thrMul * sig.z;
@@ -558,6 +579,8 @@ __kernel void ResidualEstKernel(NRParams p, int W, int H,
     const float lapY  = 4.0f * Y[4]  - 2.0f * (Y[1] + Y[3] + Y[5] + Y[7])   + (Y[0] + Y[2] + Y[6] + Y[8]);
     const float lapCb = 4.0f * Cb[4] - 2.0f * (Cb[1] + Cb[3] + Cb[5] + Cb[7]) + (Cb[0] + Cb[2] + Cb[6] + Cb[8]);
     const float lapCr = 4.0f * Cr[4] - 2.0f * (Cr[1] + Cr[3] + Cr[5] + Cr[7]) + (Cr[0] + Cr[2] + Cr[6] + Cr[8]);
+    if (lapY == 0.0f && lapCb == 0.0f && lapCr == 0.0f)  // v3.1 flat-sample skip
+        return;
     atomic_inc(&stats[H_YR + clamp((int)(fabs(lapY)  * kHistScaleY), 0, kHistBins - 1)]);
     atomic_inc(&stats[H_CR + clamp((int)(fabs(lapCb) * kHistScaleC), 0, kHistBins - 1)]);
     atomic_inc(&stats[H_CR + clamp((int)(fabs(lapCr) * kHistScaleC), 0, kHistBins - 1)]);
@@ -579,7 +602,7 @@ __kernel void FinalizeResidualKernel(NRParams p, __global uint* stats)
     float ry = sy, rc = sc, enmed = 1.0f;
 
     if (total >= 64) {
-        const float adj = clamp(p.profileAdjust, 0.25f, 4.0f);
+        const float adj = clamp(p.profileAdjust, 0.25f, 6.0f);
         ry = histQuantile(stats, H_YR, kHistBins, total, kHistScaleY, 1, 2).value * kMedianCal * adj;
         rc = histQuantile(stats, H_CR, kHistBins, total * 2, kHistScaleC, 1, 2).value * kMedianCal * adj;
         enmed = 1.0f + histQuantile(stats, H_EN, 32, total, 8.0f, 1, 2).value;
@@ -594,72 +617,118 @@ __kernel void FinalizeResidualKernel(NRParams p, __global uint* stats)
     stats[S_ENMED] = as_uint(enmed);
 }
 
-// glyph order: 0-9 . % A C E F I L M O P R S T U Y B D G N + space K
-__constant ulong kFont[33] = {
+// HUD v3 + scopes — see nr_core.h for the layout rationale
+// glyph order: 0-9 . % A-Z + space - | =
+__constant ulong kFont[43] = {
     0x3a33ae62eUL, 0x11842108eUL, 0x3a213221fUL, 0x3a213062eUL, 0x08ca97c42UL, 0x7e1e0862eUL,
     0x3a10f462eUL, 0x7c2222108UL, 0x3a317462eUL, 0x3a317842eUL, 0x00000018cUL, 0x632222263UL,
-    0x3a31fc631UL, 0x3a308422eUL, 0x7e10f421fUL, 0x7e10f4210UL, 0x38842108eUL, 0x42108421fUL,
-    0x4775ac631UL, 0x3a318c62eUL, 0x7a31f4210UL, 0x7a31f5251UL, 0x3e107043eUL, 0x7c8421084UL,
-    0x46318c62eUL, 0x462a21084UL, 0x7a31f463eUL, 0x7a318c63eUL, 0x3a30bc62fUL, 0x47359c631UL,
-    0x0084f9080UL, 0x000000000UL, 0x4654c5251UL,
+    0x3a31fc631UL, 0x7a31f463eUL, 0x3a308422eUL, 0x7a318c63eUL, 0x7e10f421fUL, 0x7e10f4210UL,
+    0x3a30bc62fUL, 0x4631fc631UL, 0x38842108eUL, 0x1c4210a4cUL, 0x4654c5251UL, 0x42108421fUL,
+    0x4775ac631UL, 0x47359c631UL, 0x3a318c62eUL, 0x7a31f4210UL, 0x3a318d64dUL, 0x7a31f5251UL,
+    0x3e107043eUL, 0x7c8421084UL, 0x46318c62eUL, 0x46318c544UL, 0x4631ad771UL, 0x462a22a31UL,
+    0x462a21084UL, 0x7c222221fUL, 0x0084f9080UL, 0x000000000UL, 0x000070000UL, 0x108421084UL,
+    0x01f07c00UL,
 };
 #define G_DOT 10
 #define G_PCT 11
 #define G_A 12
-#define G_C 13
-#define G_E 14
-#define G_F 15
-#define G_I 16
-#define G_L 17
-#define G_M 18
-#define G_O 19
-#define G_P 20
-#define G_R 21
-#define G_S 22
-#define G_T 23
-#define G_U 24
-#define G_Y 25
-#define G_B 26
-#define G_D 27
-#define G_G 28
-#define G_N 29
-#define G_PLUS 30
-#define G_SP 31
-#define G_K 32
+#define G_B 13
+#define G_C 14
+#define G_D 15
+#define G_E 16
+#define G_F 17
+#define G_G 18
+#define G_H 19
+#define G_I 20
+#define G_J 21
+#define G_K 22
+#define G_L 23
+#define G_M 24
+#define G_N 25
+#define G_O 26
+#define G_P 27
+#define G_Q 28
+#define G_R 29
+#define G_S 30
+#define G_T 31
+#define G_U 32
+#define G_V 33
+#define G_W 34
+#define G_X 35
+#define G_Y 36
+#define G_Z 37
+#define G_PLUS 38
+#define G_SP 39
+#define G_DASH 40
+#define G_BAR 41
+#define G_EQ 42
 
-__constant int kLabIY[4]  = { G_I, G_N, G_SP, G_Y };
-__constant int kLabIC[4]  = { G_I, G_N, G_SP, G_C };
+__constant int kLabIY[7]  = { G_I, G_N, G_P, G_U, G_T, G_SP, G_Y };
+__constant int kLabIC[7]  = { G_I, G_N, G_P, G_U, G_T, G_SP, G_C };
 __constant int kLabRY[10] = { G_R, G_E, G_S, G_I, G_D, G_U, G_A, G_L, G_SP, G_Y };
 __constant int kLabRC[10] = { G_R, G_E, G_S, G_I, G_D, G_U, G_A, G_L, G_SP, G_C };
-__constant int kLabOFF[3] = { G_O, G_F, G_F };
-__constant int kLabEFFN[5] = { G_E, G_F, G_F, G_SP, G_N };
+__constant int kLabAVGFR[10] = { G_A, G_V, G_G, G_SP, G_F, G_R, G_A, G_M, G_E, G_S };
 __constant int kLabGAIN[4] = { G_G, G_A, G_I, G_N };
 __constant int kLabDB[2]   = { G_D, G_B };
-__constant int kLabLOCKED[6] = { G_L, G_O, G_C, G_K, G_E, G_D };
+__constant int kLabLOCKED[14] = { G_P, G_R, G_O, G_F, G_I, G_L, G_E, G_SP,
+                                  G_L, G_O, G_C, G_K, G_E, G_D };
+__constant int kLabLIVE[14] = { G_M, G_E, G_A, G_S, G_U, G_R, G_I, G_N,
+                                G_G, G_SP, G_L, G_I, G_V, G_E };
+__constant int kLabTOFF[12] = { G_T, G_E, G_M, G_P, G_O, G_R, G_A, G_L,
+                                G_SP, G_O, G_F, G_F };
+__constant int kLabCURVE[19] = { G_N, G_O, G_I, G_S, G_E, G_SP, G_V, G_S,
+                                 G_SP, G_B, G_R, G_I, G_G, G_H, G_T, G_N,
+                                 G_E, G_S, G_S };
+__constant int kLabHIST[31] = { G_N, G_O, G_I, G_S, G_E, G_SP, G_H, G_I,
+                                G_S, G_T, G_O, G_G, G_R, G_A, G_M, G_SP,
+                                G_DASH, G_SP, G_M, G_E, G_D, G_I, G_A, G_N,
+                                G_SP, G_M, G_A, G_R, G_K, G_E, G_D };
+__constant int kLabTITLE[8] = { G_N, G_O, G_I, G_S, G_E, G_SP, G_E, G_Q };
+__constant int kLabOFF3[3]  = { G_O, G_F, G_F };
+__constant int kLabFINE[4] = { G_F, G_I, G_N, G_E };
+__constant int kLabMED[6]  = { G_M, G_E, G_D, G_I, G_U, G_M };
+__constant int kLabCRS[6]  = { G_C, G_O, G_A, G_R, G_S, G_E };
+__constant int kLabCOL[5]  = { G_C, G_O, G_L, G_O, G_R };
+__constant int kLabPX1[3]  = { 1, G_P, G_X };
+__constant int kLabPX38[5] = { 3, G_DASH, 8, G_P, G_X };
+__constant int kLabPX16[5] = { 1, 6, G_P, G_X, G_PLUS };
+__constant int kLabLEG[34] = { G_B, G_A, G_R, G_SP, G_EQ, G_SP, G_C, G_U,
+                               G_T, G_SP, G_SP, G_A, G_M, G_B, G_E, G_R,
+                               G_SP, G_EQ, G_SP, G_M, G_E, G_A, G_S, G_U,
+                               G_R, G_E, G_D, G_SP, G_N, G_O, G_I, G_S,
+                               G_E, G_SP };
+__constant int kLabMO[33] = { G_M, G_O, G_T, G_I, G_O, G_N, G_SP, G_SP,
+                              G_G, G_R, G_E, G_E, G_N, G_EQ, G_S, G_T,
+                              G_A, G_C, G_K, G_E, G_D, G_SP, G_SP, G_R,
+                              G_E, G_D, G_EQ, G_M, G_O, G_V, G_I, G_N,
+                              G_G };
 __constant float kDirX[8] = { 1, 0, -1, 0, 0.7071f, -0.7071f, -0.7071f, 0.7071f };
 __constant float kDirY[8] = { 0, 1, 0, -1, 0.7071f, 0.7071f, -0.7071f, -0.7071f };
 
 inline bool glyphPixel(int glyph, int gx, int gy)
 {
-    if (glyph < 0 || glyph > 32 || gx < 0 || gx >= 5 || gy < 0 || gy >= 7)
+    if (glyph < 0 || glyph > 42 || gx < 0 || gx >= 5 || gy < 0 || gy >= 7)
         return false;
     return (kFont[glyph] >> (34 - (gy * 5 + gx))) & 1UL;
 }
 
-inline bool textPixelC(__constant int* chars, int n, int tx, int ty, int lx, int ly)
+// sc = integer text scale: 1 -> 6x7 px cells, 2 -> 12x14 px cells
+inline bool textPixelC(__constant int* chars, int n, int tx, int ty, int lx, int ly, int sc)
 {
-    if (ly < ty || ly >= ty + 7 || lx < tx || lx >= tx + n * 6)
+    if (ly < ty || ly >= ty + 7 * sc || lx < tx || lx >= tx + n * 6 * sc)
         return false;
-    const int ci = (lx - tx) / 6;
-    return glyphPixel(chars[ci], (lx - tx) - ci * 6, ly - ty);
+    const int gx = (lx - tx) / sc;
+    const int ci = gx / 6;
+    return glyphPixel(chars[ci], gx - ci * 6, (ly - ty) / sc);
 }
 
-inline bool textPixelP(const int* chars, int n, int tx, int ty, int lx, int ly)
+inline bool textPixelP(const int* chars, int n, int tx, int ty, int lx, int ly, int sc)
 {
-    if (ly < ty || ly >= ty + 7 || lx < tx || lx >= tx + n * 6)
+    if (ly < ty || ly >= ty + 7 * sc || lx < tx || lx >= tx + n * 6 * sc)
         return false;
-    const int ci = (lx - tx) / 6;
-    return glyphPixel(chars[ci], (lx - tx) - ci * 6, ly - ty);
+    const int gx = (lx - tx) / sc;
+    const int ci = gx / 6;
+    return glyphPixel(chars[ci], gx - ci * 6, (ly - ty) / sc);
 }
 
 inline void pctGlyphs(float pp, int* outg)
@@ -682,6 +751,15 @@ inline void dec1Glyphs(float v, int* outg)
     outg[2] = t % 10;
 }
 
+inline void pctIntGlyphs(float frac, int* outg)
+{
+    const int v = clamp((int)(frac * 100.0f + 0.5f), 0, 999);
+    outg[0] = (v >= 100) ? (v / 100) % 10 : G_SP;
+    outg[1] = (v >= 10) ? (v / 10) % 10 : G_SP;
+    outg[2] = v % 10;
+    outg[3] = G_PCT;
+}
+
 inline bool hudPixel(int x, int y, int W, int H,
                      float sy, float sc, float ry, float rc, float enmed,
                      uint medBin, uint hmax, __global const uint* stats,
@@ -690,54 +768,54 @@ inline bool hudPixel(int x, int y, int W, int H,
     const int yd = H - 1 - y;   // OFX buffers are bottom-up; panel anchors top-left on screen
     const int s = max(1, H / 540);
     const int ox = 16 * s, oy = 16 * s;
-    const int lw = 320, lh = 198;
+    const int lw = 360, lh = 294;
     if (x < ox || yd < oy || x >= ox + lw * s || yd >= oy + lh * s)
         return false;
     const int lx = (x - ox) / s;
     const int ly = (yd - oy) / s;
 
-    *rgb = *rgb * 0.20f + (float3)(0.015f, 0.015f, 0.02f);
+    *rgb = (float3)(0.045f, 0.045f, 0.05f);
     if (lx == 0 || ly == 0 || lx == lw - 1 || ly == lh - 1) {
         *rgb = (float3)(0.35f);
         return true;
     }
 
     const float sig[4] = { sy, sc, ry, rc };
-    const int rowY[4] = { 6, 28, 50, 72 };
+    const int rowY[4] = { 10, 42, 74, 106 };
 
     for (int row = 0; row < 4; ++row) {
         const int ty0 = rowY[row];
         bool lit = false;
-        if (row == 0) lit = textPixelC(kLabIY, 4,  8, ty0, lx, ly);
-        if (row == 1) lit = textPixelC(kLabIC, 4,  8, ty0, lx, ly);
-        if (row == 2) lit = textPixelC(kLabRY, 10, 8, ty0, lx, ly);
-        if (row == 3) lit = textPixelC(kLabRC, 10, 8, ty0, lx, ly);
+        if (row == 0) lit = textPixelC(kLabIY, 7,  10, ty0, lx, ly, 2);
+        if (row == 1) lit = textPixelC(kLabIC, 7,  10, ty0, lx, ly, 2);
+        if (row == 2) lit = textPixelC(kLabRY, 10, 10, ty0, lx, ly, 2);
+        if (row == 3) lit = textPixelC(kLabRC, 10, 10, ty0, lx, ly, 2);
         if (!lit) {
             int vg[6];
             pctGlyphs(sig[row] * 100.0f, vg);
-            lit = textPixelP(vg, 6, 252, ty0, lx, ly);
+            lit = textPixelP(vg, 6, 278, ty0, lx, ly, 2);
         }
         if (lit) { *rgb = (float3)(1.0f); return true; }
 
-        if (ly >= ty0 + 9 && ly < ty0 + 13 && lx >= 8 && lx < 288) {
+        if (ly >= ty0 + 16 && ly < ty0 + 22 && lx >= 10 && lx < 350) {
             const float fill = clamp(sig[row] / 0.08f, 0.0f, 1.0f);
-            const bool on = (lx - 8) < (int)(fill * 280.0f);
+            const bool on = (lx - 10) < (int)(fill * 340.0f);
             const bool residRow = (row >= 2);
             if (on) *rgb = residRow ? (float3)(0.95f, 0.65f, 0.20f) : (float3)(0.20f, 0.65f, 0.95f);
-            else    *rgb = (float3)(0.16f);
+            else    *rgb = (float3)(0.14f);
             return true;
         }
     }
 
     {
-        const int ty0 = 94;
-        bool lit = textPixelC(kLabEFFN, 5, 8, ty0, lx, ly);
+        const int ty0 = 138;
+        bool lit = textPixelC(kLabAVGFR, 10, 10, ty0, lx, ly, 2);
         if (!lit) {
             int vg[3];
             dec1Glyphs(enableTemporal ? enmed : 1.0f, vg);
-            lit = textPixelP(vg, 3, 44, ty0, lx, ly);
+            lit = textPixelP(vg, 3, 138, ty0, lx, ly, 2);
         }
-        if (!lit) lit = textPixelC(kLabGAIN, 4, 120, ty0, lx, ly);
+        if (!lit) lit = textPixelC(kLabGAIN, 4, 186, ty0, lx, ly, 2);
         if (!lit) {
             const float gainDb = clamp(20.0f * log10(fmax(sy, 1e-5f) / fmax(ry, 1e-5f)), 0.0f, 40.0f);
             int vg[4];
@@ -745,36 +823,173 @@ inline bool hudPixel(int x, int y, int W, int H,
             int d1[3];
             dec1Glyphs(gainDb, d1);
             vg[1] = d1[0]; vg[2] = d1[1]; vg[3] = d1[2];
-            lit = textPixelP(vg, 4, 150, ty0, lx, ly);
-            if (!lit) lit = textPixelC(kLabDB, 2, 178, ty0, lx, ly);
+            lit = textPixelP(vg, 4, 240, ty0, lx, ly, 2);
+            if (!lit) lit = textPixelC(kLabDB, 2, 294, ty0, lx, ly, 2);
         }
         if (lit) { *rgb = (float3)(1.0f); return true; }
-        if (enableTemporal == 0 && textPixelC(kLabOFF, 3, 220, ty0, lx, ly)) { *rgb = (float3)(0.7f); return true; }
-        if (locked && textPixelC(kLabLOCKED, 6, 246, ty0, lx, ly)) { *rgb = (float3)(0.95f, 0.65f, 0.20f); return true; }
     }
 
-    if (lx >= 8 && lx < 264 && ly >= 108 && ly < 148) {
-        const int bin = clamp((lx - 8) / 16, 0, kLumaBins - 1);
+    {
+        const int ty0 = 160;
+        if (locked) {
+            if (textPixelC(kLabLOCKED, 14, 10, ty0, lx, ly, 2)) { *rgb = (float3)(0.95f, 0.65f, 0.20f); return true; }
+        } else {
+            if (textPixelC(kLabLIVE, 14, 10, ty0, lx, ly, 2)) { *rgb = (float3)(0.55f); return true; }
+        }
+        if (enableTemporal == 0 && textPixelC(kLabTOFF, 12, 190, ty0, lx, ly, 2)) {
+            *rgb = (float3)(0.90f, 0.45f, 0.30f); return true;
+        }
+    }
+
+    if (textPixelC(kLabCURVE, 19, 10, 182, lx, ly, 1)) { *rgb = (float3)(0.55f); return true; }
+    if (lx >= 10 && lx < 346 && ly >= 194 && ly < 238) {
+        const int bin = clamp((lx - 10) / 21, 0, kLumaBins - 1);
         const float gain = as_float(stats[S_GY + bin]);
         const float v = clamp((gain - 0.6f) / 1.6f, 0.0f, 1.0f);
-        const bool bar = (147 - ly) < (int)(v * 39.0f + 0.5f);
-        const bool ref = (147 - ly) == (int)((1.0f - 0.6f) / 1.6f * 39.0f + 0.5f);
+        const bool bar = (237 - ly) < (int)(v * 43.0f + 0.5f);
+        const bool ref = (237 - ly) == (int)((1.0f - 0.6f) / 1.6f * 43.0f + 0.5f);
         if (bar)      *rgb = (float3)(0.20f, 0.65f, 0.95f);
-        else if (ref) *rgb = (float3)(0.32f);
-        else          *rgb = (float3)(0.10f);
+        else if (ref) *rgb = (float3)(0.42f);
+        else          *rgb = (float3)(0.08f);
         return true;
     }
 
-    if (lx >= 8 && lx < 268 && ly >= 156 && ly < 192) {
-        const int bin = clamp((lx - 8) * kHistBins / 260, 0, kHistBins - 1);
-        const float hgt = 35.0f * (float)stats[H_YF + bin] / (float)max(hmax, 1u);
-        const bool bar = (191 - ly) < (int)(hgt + 0.5f);
+    if (textPixelC(kLabHIST, 31, 10, 244, lx, ly, 1)) { *rgb = (float3)(0.55f); return true; }
+    if (lx >= 10 && lx < 346 && ly >= 252 && ly < 284) {
+        const int bin = clamp((lx - 10) * kHistBins / 336, 0, kHistBins - 1);
+        const float frac = (float)stats[H_YF + bin] / (float)max(hmax, 1u);
+        const float hgt = 31.0f * sqrt(clamp(frac, 0.0f, 1.0f));
+        const bool bar = (283 - ly) < (int)(hgt + 0.5f);
         if (bin == (int)medBin)  *rgb = (float3)(0.95f, 0.85f, 0.15f);
         else if (bar)            *rgb = (float3)(0.55f);
-        else                     *rgb = (float3)(0.10f);
+        else                     *rgb = (float3)(0.08f);
         return true;
     }
 
+    return true;
+}
+
+// Noise EQ panel (top-right) — see nr_core.h
+inline bool eqScopePixel(int x, int y, int W, int H,
+                         float fineY, float fineC, float coarseY, float tyv, float tcv,
+                         float eqFine, float eqMedium, float eqCoarse, float chromaBlotch,
+                         int enableSpatial, float3* rgb)
+{
+    const int yd = H - 1 - y;
+    const int s = max(1, H / 540);
+    const int lw = 300, lh = 190;
+    const int ox = W - 16 * s - lw * s, oy = 16 * s;
+    if (x < ox || yd < oy || x >= ox + lw * s || yd >= oy + lh * s)
+        return false;
+    const int lx = (x - ox) / s;
+    const int ly = (yd - oy) / s;
+
+    *rgb = (float3)(0.045f, 0.045f, 0.05f);
+    if (lx == 0 || ly == 0 || lx == lw - 1 || ly == lh - 1) {
+        *rgb = (float3)(0.35f);
+        return true;
+    }
+
+    if (textPixelC(kLabTITLE, 8, 10, 8, lx, ly, 2)) { *rgb = (float3)(1.0f); return true; }
+    if (enableSpatial == 0 && textPixelC(kLabOFF3, 3, 250, 8, lx, ly, 2)) {
+        *rgb = (float3)(0.90f, 0.45f, 0.30f); return true;
+    }
+    if (textPixelC(kLabLEG, 34, 10, 172, lx, ly, 1)) { *rgb = (float3)(0.55f); return true; }
+
+    const float fineM = fmax(fineY, coarseY);
+    const float lowY = sqrt(fmax(0.0f, tyv * tyv - fineM * fineM));
+    const float lowC = sqrt(fmax(0.0f, tcv * tcv - fineC * fineC));
+    const float amt[4] = { clamp(eqFine, 0.0f, 3.0f) / 3.0f,
+                           clamp(eqMedium, 0.0f, 1.5f) / 1.5f,
+                           clamp(eqCoarse, 0.0f, 1.5f) / 1.5f,
+                           clamp(chromaBlotch, 0.0f, 1.5f) / 1.5f };
+    const float rawPct[4] = { clamp(eqFine, 0.0f, 3.0f),
+                              clamp(eqMedium, 0.0f, 1.5f),
+                              clamp(eqCoarse, 0.0f, 1.5f),
+                              clamp(chromaBlotch, 0.0f, 1.5f) };
+    const float meas[4] = { fineY, coarseY, lowY, lowC };
+
+    for (int lane = 0; lane < 4; ++lane) {
+        const int x0 = 10 + lane * 72;
+        if (lx < x0 || lx >= x0 + 60)
+            continue;
+
+        {
+            int vg[4];
+            pctIntGlyphs(rawPct[lane], vg);
+            if (textPixelP(vg, 4, x0 + 18, 32, lx, ly, 1)) { *rgb = (float3)(0.85f); return true; }
+        }
+        bool lit = false;
+        if (lane == 0) lit = textPixelC(kLabFINE, 4, x0 + 18, 148, lx, ly, 1) ||
+                             textPixelC(kLabPX1, 3, x0 + 21, 158, lx, ly, 1);
+        if (lane == 1) lit = textPixelC(kLabMED, 6, x0 + 12, 148, lx, ly, 1) ||
+                             textPixelC(kLabPX38, 5, x0 + 15, 158, lx, ly, 1);
+        if (lane == 2) lit = textPixelC(kLabCRS, 6, x0 + 12, 148, lx, ly, 1) ||
+                             textPixelC(kLabPX16, 5, x0 + 15, 158, lx, ly, 1);
+        if (lane == 3) lit = textPixelC(kLabCOL, 5, x0 + 15, 148, lx, ly, 1) ||
+                             textPixelC(kLabPX16, 5, x0 + 15, 158, lx, ly, 1);
+        if (lit) { *rgb = (float3)(0.75f); return true; }
+
+        if (ly >= 44 && ly < 144) {
+            const int up = 143 - ly;
+            const float nv = clamp(meas[lane] / 0.08f, 0.0f, 1.0f);
+            const int markH = (int)(nv * 98.0f + 0.5f);
+            const int barH = (int)(clamp(amt[lane], 0.0f, 1.0f) * 98.0f + 0.5f);
+            if (up >= markH - 1 && up <= markH + 1 && meas[lane] > 1e-5f) {
+                *rgb = (float3)(0.95f, 0.65f, 0.20f);
+            } else if (up < barH) {
+                *rgb = (up >= barH - 3) ? (float3)(0.90f) : (float3)(0.30f);
+            } else {
+                *rgb = (float3)(0.08f);
+            }
+            return true;
+        }
+        return true;
+    }
+
+    return true;
+}
+
+// Temporal-activity mini map (bottom-right) — see nr_core.h
+inline bool motionScopePixel(int x, int y, int W, int H,
+                             __global const float4* tmp, __global const float4* curr,
+                             float3* rgb)
+{
+    const int yd = H - 1 - y;
+    const int s = max(1, H / 540);
+    const int mapW = 300;
+    const int mapH = max(40, (mapW * H) / max(W, 1));
+    const int lw = mapW + 2, lh = mapH + 18;
+    const int ox = W - 16 * s - lw * s, oy = H - 16 * s - lh * s;
+    if (x < ox || yd < oy || x >= ox + lw * s || yd >= oy + lh * s)
+        return false;
+    const int lx = (x - ox) / s;
+    const int ly = (yd - oy) / s;
+
+    if (lx == 0 || ly == 0 || lx == lw - 1 || ly == lh - 1) {
+        *rgb = (float3)(0.35f);
+        return true;
+    }
+
+    if (ly < 16) {
+        *rgb = (float3)(0.045f, 0.045f, 0.05f);
+        if (textPixelC(kLabMO, 33, 4, 5, lx, ly, 1)) *rgb = (float3)(0.85f);
+        return true;
+    }
+
+    const int u = clamp(lx - 1, 0, mapW - 1);
+    const int v = clamp(ly - 16, 0, mapH - 1);
+    const int sx = clamp((u * W) / mapW, 0, W - 1);
+    const int sdy = clamp((v * H) / mapH, 0, H - 1);
+    const int sy2 = H - 1 - sdy;
+    const float4 t = tmp[sy2 * W + sx];
+    const float3 cin = rgb2ycc(curr[sy2 * W + sx].xyz);
+    const float effN = fmax(1.0f, t.w);
+    const float tt = clamp((effN - 1.0f) / 4.0f, 0.0f, 1.0f);
+    const float3 heat = (float3)(0.90f + (0.10f - 0.90f) * tt,
+                                 0.15f + (0.85f - 0.15f) * tt,
+                                 0.10f + (0.20f - 0.10f) * tt);
+    *rgb = cin.x * 0.45f + heat * 0.55f;
     return true;
 }
 
@@ -800,28 +1015,38 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
     const float mHigh = fmax(p.master, 1.0f);
     const float hBoost = pow(mHigh, 1.2f);
 
-    const float sL = clamp(p.spatialLuma, 0.0f, 1.0f);
-    const float sC = clamp(p.spatialChroma, 0.0f, 1.0f);
-    // v3 Noise EQ: the fine slider scales the NLM band's blend (1 = v2.1)
-    const float eqF = clamp(p.eqFine, 0.0f, 2.0f);
+    const float sL = clamp(p.spatialLuma, 0.0f, 1.5f);
+    const float sC = clamp(p.spatialChroma, 0.0f, 1.5f);
+    // v3 Noise EQ: the fine slider scales the NLM band's blend (1 = v2.1);
+    // v3.1: above 100% it also widens the similarity h
+    const float eqF = clamp(p.eqFine, 0.0f, 3.0f);
+    const float eqH = sqrt(fmax(1.0f, eqF));
     const float aY = (p.enableSpatial == 0) ? 0.0f : clamp(sL * mLow * eqF, 0.0f, 1.0f);
     const float aC = (p.enableSpatial == 0) ? 0.0f : clamp(sC * mLow * eqF, 0.0f, 1.0f);
-    const float hMulY = (0.6f + 1.4f * pow(sL, 1.5f)) * hBoost;
-    const float hMulC = (0.6f + 1.4f * pow(sC, 1.5f)) * hBoost;
+    const float hMulY = (0.6f + 1.4f * pow(sL, 1.5f)) * hBoost * eqH;
+    const float hMulC = (0.6f + 1.4f * pow(sC, 1.5f)) * hBoost * eqH;
     const float pd = clamp(p.preserveDetail, 0.0f, 1.0f);
-    const int   R  = clamp(p.spatialRadius, 1, 8);
+    const int   R  = clamp(p.spatialRadius, 1, 10);
     const int   nlm = (p.spatialMode == 1);
     const int   runSpatial = (p.enableSpatial != 0) && (aY > 0.0f || aC > 0.0f);
     const float spatialSigma = fmax(1.0f, (float)R / 1.5f);
     const float invSpatial2 = 1.0f / (2.0f * spatialSigma * spatialSigma);
+    // v3.1 Detail Rescue — see nr_core.h
+    const float rescue = clamp(p.detailRescue, 0.0f, 1.0f);
 
-    const float blotch = (p.enableSpatial != 0) ? clamp(p.chromaBlotch, 0.0f, 1.0f) * mLow : 0.0f;
+    // v3.1: band sliders reach 150 — amount caps at 1, the extra drive
+    // widens the similarity tolerances and the reach instead
+    const float blotchRaw = clamp(p.chromaBlotch, 0.0f, 1.5f);
+    const float medRaw    = clamp(p.eqMedium, 0.0f, 1.5f);
+    const float coarseRaw = clamp(p.eqCoarse, 0.0f, 1.5f);
+    const float blotch = (p.enableSpatial != 0) ? fmin(blotchRaw * mLow, 1.0f) : 0.0f;
     // v3 Noise EQ: medium band amount and coarse-band luma amount
-    const float eqMed  = (p.enableSpatial != 0) ? clamp(p.eqMedium, 0.0f, 1.0f) * mLow : 0.0f;
-    const float coarseL = (p.enableSpatial != 0) ? clamp(p.eqCoarse, 0.0f, 1.0f) * mLow : 0.0f;
-    const int   Rb = 2 + (int)(14.0f * fmax(clamp(p.chromaBlotch, 0.0f, 1.0f),
-                                            clamp(p.eqCoarse, 0.0f, 1.0f)));
-    const int   Rm = 3 + (int)(5.0f * clamp(p.eqMedium, 0.0f, 1.0f));
+    const float eqMed  = (p.enableSpatial != 0) ? fmin(medRaw * mLow, 1.0f) : 0.0f;
+    const float coarseL = (p.enableSpatial != 0) ? fmin(coarseRaw * mLow, 1.0f) : 0.0f;
+    const float medOver = fmax(1.0f, medRaw);
+    const float crsOver = fmax(1.0f, fmax(blotchRaw, coarseRaw));
+    const int   Rb = 2 + (int)(14.0f * fmax(blotchRaw, coarseRaw));
+    const int   Rm = 3 + (int)(5.0f * medRaw);
     // Band tolerance: see nr_core.h
     const float bandRatioY = clamp(tyG / fmax(sy, 1e-6f), 1.0f, 3.0f);
     const float bandRatioC = clamp(tcG / fmax(sc, 1e-6f), 1.0f, 3.0f);
@@ -926,16 +1151,25 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
         const float Cbf = (accCb + wCc * tc.y) / (sumWC + wCc);
         const float Crf = (accCr + wCc * tc.z) / (sumWC + wCc);
 
-        Yo  = tc.x + aY * (Yf  - tc.x);
-        Cbo = tc.y + aC * (Cbf - tc.y);
-        Cro = tc.z + aC * (Crf - tc.z);
+        // v3.1 Detail Rescue — see nr_core.h for the coring rationale
+        if (rescue > 0.0f) {
+            const float kY = sigY * (2.0f + 6.0f * (1.0f - rescue));
+            const float kC = sigC * (3.0f + 9.0f * (1.0f - rescue));
+            Yo  = tc.x - aY * clamp(tc.x - Yf,  -kY, kY);
+            Cbo = tc.y - aC * clamp(tc.y - Cbf, -kC, kC);
+            Cro = tc.z - aC * clamp(tc.z - Crf, -kC, kC);
+        } else {
+            Yo  = tc.x + aY * (Yf  - tc.x);
+            Cbo = tc.y + aC * (Cbf - tc.y);
+            Cro = tc.z + aC * (Crf - tc.z);
+        }
     }
 
     // v3 medium band — see nr_core.h for the block-mean-domain rationale
     if (eqMed > 0.0f) {
-        const float mScale = 2.6f * sigY * bandRatioY * hBoost;
+        const float mScale = 2.6f * sigY * bandRatioY * hBoost * medOver;
         const float myDen = 1.0f / fmax(mScale, 1e-6f);
-        const float mcDen = 1.0f / fmax(3.0f * sigC * bandRatioC * hBoost, 1e-6f);
+        const float mcDen = 1.0f / fmax(3.0f * sigC * bandRatioC * hBoost * medOver, 1e-6f);
         const float3 b0 = blockMeanTmp(tmp, W, H, x, y);
         float accMY = b0.x, accMB = b0.y, accMR = b0.z, sumWm = 1.0f;
         for (int d = 0; d < 8; ++d) {
@@ -962,11 +1196,11 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
     // coarse band — chroma path is the v2.1 blotch pass unchanged; the v3
     // luma component works on 4x4 block means (see nr_core.h)
     if (blotch > 0.0f || coarseL > 0.0f) {
-        const float gyDen = 1.0f / fmax(2.0f * sigY * hBoost, 1e-6f);
-        const float gcDen = 1.0f / fmax(3.0f * sigC * hBoost, 1e-6f);
-        const float cScale = 2.2f * sigY * bandRatioY * hBoost;
+        const float gyDen = 1.0f / fmax(2.0f * sigY * hBoost * crsOver, 1e-6f);
+        const float gcDen = 1.0f / fmax(3.0f * sigC * hBoost * crsOver, 1e-6f);
+        const float cScale = 2.2f * sigY * bandRatioY * hBoost * crsOver;
         const float glDen = 1.0f / fmax(cScale, 1e-6f);
-        const int RbL = 2 + (int)(30.0f * clamp(p.eqCoarse, 0.0f, 1.0f));
+        const int RbL = 2 + (int)(30.0f * coarseRaw);
         float3 c0 = (float3)(0.0f);
         if (coarseL > 0.0f)
             c0 = blockMean4Tmp(tmp, W, H, x, y);
@@ -1070,22 +1304,14 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
     } else if (p.viewMode == 3) {
         o.xyz = ycc2rgb(tc.xyz);
     } else if (p.viewMode == 4) {
-        o.xyz = 0.5f + (c.xyz - dn) * 4.0f;
+        // noise removed: noise-adaptive gain + soft knee — see nr_core.h
+        const float nrGain = 0.08f / clamp(sy, 0.004f, 0.08f);
+        const float3 d = (c.xyz - dn) * nrGain;
+        o.xyz = 0.5f + 0.5f * d / (0.5f + fabs(d));
     } else if (p.viewMode == 5) {
-        float3 hud = rgb;
-        if (!hudPixel(x, y, W, H, sy, sc, ryG, rcG, enmed,
-                      stats[S_MED], stats[S_HMAX], stats, p.enableTemporal,
-                      p.profileLocked, &hud)) {
-            if (p.profileSource == 1) {
-                const float rHalf = 0.5f * p.regionSize * (float)min(W, H);
-                const float cx = p.regionCX * W, cyy = p.regionCY * H;
-                const float ax = fabs((float)x - cx), ay = fabs((float)y - cyy);
-                const int onEdge = (ax <= rHalf && ay <= rHalf) &&
-                                   (ax >= rHalf - 2.0f || ay >= rHalf - 2.0f);
-                if (onEdge) hud = (float3)(1.0f, 1.0f, 0.1f);
-            }
-        }
-        o.xyz = hud;
+        // noise analysis: the result; the measurement scope is drawn by the
+        // overlay pass below
+        o.xyz = rgb;
     } else if (p.viewMode == 6) {
         const float effN = fmax(1.0f, tc.w);
         const float t = clamp((effN - 1.0f) / 4.0f, 0.0f, 1.0f);
@@ -1134,6 +1360,43 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
         const float snrDb = 20.0f * log10(fmax(sigSignal, 1e-6f) / sigNoise);
         const float m = 1.0f - clamp((snrDb + 6.0f) / 36.0f, 0.0f, 1.0f);
         o = (float4)(m, m, m, m);
+    }
+
+    // ---- v3.1 scope overlays: drawn over ANY view, never into alpha ----
+    {
+        const int wantHud = (p.scopeMeasure != 0) || (p.viewMode == 5);
+        const int wantEq  = (p.scopeEq != 0);
+        const int wantMo  = (p.scopeMotion != 0);
+        if (wantHud || wantEq || wantMo) {
+            float3 sco = o.xyz;
+            int drew = 0;
+            if (wantEq) {
+                const float fineY = manual ? sy : as_float(stats[S_FINEY]);
+                const float fineC = manual ? sc : as_float(stats[S_FINEC]);
+                const float crsY  = manual ? sy : as_float(stats[S_CRSY]);
+                if (eqScopePixel(x, y, W, H, fineY, fineC, crsY, tyG, tcG,
+                                 p.eqFine, p.eqMedium, p.eqCoarse, p.chromaBlotch,
+                                 p.enableSpatial, &sco))
+                    drew = 1;
+            }
+            if (wantMo && motionScopePixel(x, y, W, H, tmp, curr, &sco))
+                drew = 1;
+            if (wantHud) {
+                if (hudPixel(x, y, W, H, sy, sc, ryG, rcG, enmed,
+                             stats[S_MED], stats[S_HMAX], stats, p.enableTemporal,
+                             p.profileLocked, &sco)) {
+                    drew = 1;
+                } else if (p.profileSource == 1) {
+                    const float rHalf = 0.5f * p.regionSize * (float)min(W, H);
+                    const float cx = p.regionCX * W, cyy = p.regionCY * H;
+                    const float ax = fabs((float)x - cx), ay = fabs((float)y - cyy);
+                    const int onEdge = (ax <= rHalf && ay <= rHalf) &&
+                                       (ax >= rHalf - 2.0f || ay >= rHalf - 2.0f);
+                    if (onEdge) { sco = (float3)(1.0f, 1.0f, 0.1f); drew = 1; }
+                }
+            }
+            if (drew) o.xyz = sco;
+        }
     }
 
     dst[y * W + x] = o;

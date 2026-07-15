@@ -89,6 +89,10 @@ static void toCpuParams(const NRParams& gp, nrcore::Params& cp)
         cp.lockGainY[b] = gp.lockGainY[b];
         cp.lockGainC[b] = gp.lockGainC[b];
     }
+    cp.detailRescue   = gp.detailRescue;
+    cp.scopeMeasure   = gp.scopeMeasure;
+    cp.scopeMotion    = gp.scopeMotion;
+    cp.scopeEq        = gp.scopeEq;
 }
 
 // sparseOK: cases that exercise the v3 shift-search selection. Picking the
@@ -98,8 +102,13 @@ static void toCpuParams(const NRParams& gp, nrcore::Params& cp)
 // blend a different noise sample — individually visible to the diff, but
 // bounded in count. Assert tight mean agreement plus a bounded outlier
 // fraction instead of a strict max.
+// hudOK: cases that render scope panels. Bar heights and value digits are
+// integer-quantized display math (int(sqrt(...)+0.5) etc); a 1-ulp fast-math
+// difference legitimately flips a bar-edge row or a rounded digit — huge
+// per-pixel diff, but bounded to a handful of panel pixels. Assert a tiny
+// mean and a tiny absolute count instead of a strict max.
 static int compareRun(id<MTLCommandQueue> queue, const NRParams& gp, const char* label,
-                      bool sparseOK = false, bool injectImpulses = false)
+                      bool sparseOK = false, bool injectImpulses = false, bool hudOK = false)
 {
     std::vector<std::vector<float>> frames(5);
     for (int k = 0; k < 5; ++k)
@@ -156,6 +165,8 @@ static int compareRun(id<MTLCommandQueue> queue, const NRParams& gp, const char*
     bool pass = (maxd < 5e-3) && (meand < 1e-4);
     if (!pass && sparseOK)
         pass = (meand < 1.5e-4) && (overFrac < 5e-3) && (maxd < 0.25);
+    if (!pass && hudOK)
+        pass = (meand < 5e-5) && (nOver <= 400);
     printf("  [%s] %-36s max %.2e  mean %.2e  over %zu\n",
            pass ? "PASS" : "FAIL", label, maxd, meand, nOver);
     return pass ? 0 : 1;
@@ -233,7 +244,7 @@ int main()
     failures += compareRun(queue, p12, "after-temporal view");
 
     NRParams p13 = p; p13.viewMode = 5; p13.profileSource = 1;
-    failures += compareRun(queue, p13, "analysis HUD v2 view");
+    failures += compareRun(queue, p13, "analysis HUD view", false, false, true);
 
     NRParams p14 = p; p14.viewMode = 7;
     failures += compareRun(queue, p14, "SNR map view");
@@ -269,10 +280,31 @@ int main()
     failures += compareRun(queue, v7, "v3 locked overrides manual");
 
     NRParams v8 = v6; v8.viewMode = 5;
-    failures += compareRun(queue, v8, "v3 HUD with LOCKED tag");
+    failures += compareRun(queue, v8, "v3 HUD with LOCKED tag", false, false, true);
 
     NRParams v9 = p; v9.viewMode = 8;
     failures += compareRun(queue, v9, "v3 noise matte view");
+
+    // ---- v3.1 cases ----
+    NRParams w1 = p; w1.detailRescue = 0.8f; w1.spatialLuma = 1.5f;
+    w1.spatialChroma = 1.5f; w1.eqFine = 3.0f; w1.spatialRadius = 10; w1.master = 3.0f;
+    failures += compareRun(queue, w1, "v3.1 full crank + detail rescue");
+
+    NRParams w2 = p; w2.detailRescue = 0.4f;
+    failures += compareRun(queue, w2, "v3.1 detail rescue at defaults");
+
+    NRParams w3 = p; w3.chromaBlotch = 1.5f; w3.eqMedium = 1.5f; w3.eqCoarse = 1.2f;
+    failures += compareRun(queue, w3, "v3.1 band overshoot (150s)");
+
+    NRParams w4 = p; w4.scopeMeasure = 1; w4.scopeMotion = 1; w4.scopeEq = 1;
+    failures += compareRun(queue, w4, "v3.1 all scopes on result view", false, false, true);
+
+    NRParams w5 = p; w5.scopeEq = 1; w5.profileSource = 2;
+    w5.sigmaY = 0.03f; w5.sigmaC = 0.02f;
+    failures += compareRun(queue, w5, "v3.1 EQ scope, manual profile", false, false, true);
+
+    NRParams w6 = p; w6.viewMode = 4; w6.temporalLuma = 1.25f; w6.motionThresh = 1.5f;
+    failures += compareRun(queue, w6, "v3.1 noise view + extended temporal");
 
     printf(failures == 0 ? "ALL GPU PARITY CHECKS PASSED\n" : "%d GPU PARITY CHECK(S) FAILED\n", failures);
     return failures == 0 ? 0 : 1;

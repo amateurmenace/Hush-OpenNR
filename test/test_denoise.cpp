@@ -298,6 +298,7 @@ static nrcore::Params paramsFromAuto(const nranalyze::AutoSettings& as,
     q.spatialLuma    = as.spatialLuma / 100.0f;
     q.spatialChroma  = as.spatialChroma / 100.0f;
     q.preserveDetail = as.preserveDetail / 100.0f;
+    q.detailRescue   = as.detailRescue / 100.0f;
     q.chromaBlotch   = as.chromaBlotch / 100.0f;
     q.eqFine         = as.eqFine / 100.0f;
     q.eqMedium       = as.eqMedium / 100.0f;
@@ -888,7 +889,7 @@ int main()
 
         const AutoSettings sBlotch = nranalyze::mapAnalysisToSettings(makeAgg(0.015f, 0.02f, 2.6f, 1.7f));
         check(sBlotch.chromaBlotch >= sMod.chromaBlotch + 30.0f, "blotchy chroma raises the blotch pass");
-        check(sBlotch.spatialChroma == 100.0f, "blotchy chroma maxes chroma strength");
+        check(sBlotch.spatialChroma >= 110.0f, "blotchy chroma pushes chroma strength up");
         check(sBlotch.eqMedium >= 25.0f && sBlotch.eqCoarse >= 10.0f, "correlated noise raises medium/coarse bands");
 
         const std::string rep = nranalyze::formatAutoReport(makeAgg(0.032f, 0.5f, 1.2f, 1.0f), sMotion);
@@ -930,6 +931,121 @@ int main()
                 check(rAuto.after >= rDef.after - 0.05, msg);
             }
         }
+    }
+
+    // =====================================================================
+    // v3.1 — Detail Rescue: crank everything, rescue restores structure
+    // =====================================================================
+    {
+        nrcore::Params pc = p;
+        pc.master = 3.0f;
+        pc.spatialLuma = 1.5f; pc.spatialChroma = 1.5f;
+        pc.eqFine = 3.0f; pc.spatialRadius = 10;
+        pc.preserveDetail = 0.0f;
+        pc.eqMedium = 1.0f; pc.eqCoarse = 0.5f;
+        nrcore::Params pr = pc; pr.detailRescue = 0.8f;
+        const CaseResult r0 = runCase(0.05f, 0.0f, 0.0f, NOISE_IID, pc);
+        const CaseResult r1 = runCase(0.05f, 0.0f, 0.0f, NOISE_IID, pr);
+        printf("v3.1 rescue at full crank: without %5.2f dB -> with %5.2f dB\n", r0.after, r1.after);
+        check(r1.after > r0.after + 1.5, "detail rescue recovers >= 1.5 dB at full crank");
+        // full crank deliberately trades PSNR for smoothness — the bound
+        // that matters is that rescue keeps it net-positive vs the input
+        check(r1.after > r1.before + 1.0, "cranked + rescue stays net-positive");
+    }
+
+    // v3.1 — the top half of EQ Fine is no longer a silent no-op
+    {
+        nrcore::Params pa = p; pa.spatialLuma = 1.0f; pa.eqFine = 1.5f;
+        nrcore::Params pb = p; pb.spatialLuma = 1.0f; pb.eqFine = 3.0f;
+        std::vector<float> oa, ob;
+        runCase(0.05f, 0.0f, 0.0f, NOISE_IID, pa, &oa);
+        runCase(0.05f, 0.0f, 0.0f, NOISE_IID, pb, &ob);
+        double d = 0.0;
+        for (size_t i = 0; i < oa.size(); ++i) d += std::fabs(oa[i] - ob[i]);
+        check(d / oa.size() > 1e-4, "EQ Fine above 150 changes the result (h widening)");
+    }
+
+    // v3.1 — extended ranges engage: master 3 > 2, band overshoot works
+    {
+        nrcore::Params m2 = p; m2.master = 2.0f;
+        nrcore::Params m3 = p; m3.master = 3.0f;
+        std::vector<float> o2, o3;
+        runCase(0.10f, 0.0f, 0.0f, NOISE_IID, m2, &o2);
+        runCase(0.10f, 0.0f, 0.0f, NOISE_IID, m3, &o3);
+        double d = 0.0;
+        for (size_t i = 0; i < o2.size(); ++i) d += std::fabs(o2[i] - o3[i]);
+        check(d / o2.size() > 2e-4, "master 3 filters harder than master 2");
+
+        nrcore::Params b1 = p;  b1.chromaBlotch = 1.0f;  b1.eqMedium = 1.0f;
+        nrcore::Params b15 = p; b15.chromaBlotch = 1.5f; b15.eqMedium = 1.5f;
+        std::vector<float> ob1, ob15;
+        runCase(0.04f, 0.0f, 0.0f, NOISE_BLOTCH, b1, &ob1);
+        runCase(0.04f, 0.0f, 0.0f, NOISE_BLOTCH, b15, &ob15);
+        d = 0.0;
+        for (size_t i = 0; i < ob1.size(); ++i) d += std::fabs(ob1[i] - ob15[i]);
+        check(d / ob1.size() > 1e-4, "band sliders above 100 widen tolerance and reach");
+    }
+
+    // v3.1 — noise view: soft-knee output stays inside [0,1]
+    {
+        nrcore::Params pv = p; pv.viewMode = 4;
+        std::vector<float> nv;
+        runCase(0.05f, 0.0f, 0.0f, NOISE_IID, pv, &nv);
+        bool ok = true;
+        for (size_t i = 0; i < nv.size(); i += 4)
+            if (!(nv[i] >= 0.0f && nv[i] <= 1.0f && nv[i+1] >= 0.0f && nv[i+1] <= 1.0f &&
+                  nv[i+2] >= 0.0f && nv[i+2] <= 1.0f)) { ok = false; break; }
+        check(ok, "noise view (soft knee) stays inside [0,1]");
+    }
+
+    // v3.1 — scope overlays draw over the result and never touch alpha
+    {
+        nrcore::Params ps2 = p;
+        ps2.scopeMeasure = 1; ps2.scopeEq = 1; ps2.scopeMotion = 1;
+        std::vector<float> withScopes, without;
+        runCase(0.05f, 0.0f, 0.0f, NOISE_IID, ps2, &withScopes);
+        runCase(0.05f, 0.0f, 0.0f, NOISE_IID, p, &without);
+        writePPM("out_scopes.ppm", withScopes);
+        auto differsAt = [&](int xd, int ydTop) {
+            const size_t i = (static_cast<size_t>(H - 1 - ydTop) * W + xd) * 4;
+            return withScopes[i] != without[i] || withScopes[i+1] != without[i+1] ||
+                   withScopes[i+2] != without[i+2];
+        };
+        const bool drewHud = differsAt(30, 30);              // top-left panel
+        const bool drewEq  = differsAt(W - 30, 30);          // top-right panel
+        const bool drewMo  = differsAt(W - 30, H - 30);      // bottom-right map
+        check(drewHud && drewEq && drewMo, "all three scopes draw on the result view");
+        bool alphaSame = true, bounded = true;
+        for (size_t i = 0; i < withScopes.size(); i += 4) {
+            if (withScopes[i+3] != without[i+3]) { alphaSame = false; break; }
+            if (!(withScopes[i] >= 0.0f && withScopes[i] <= 1.0f)) bounded = false;
+        }
+        check(alphaSame, "scopes never write into alpha");
+        check(bounded, "scope pixels stay inside [0,1]");
+    }
+
+    // v3.1 — letterboxed footage no longer collapses the measurement
+    {
+        std::vector<float> clean;
+        renderScene(clean, 0, 0);
+        std::vector<float> noisy = clean;
+        addNoise(noisy, 0.05f, 77);
+        const float truth = trueSigmaY(noisy, clean);
+        std::vector<float> boxed = noisy;
+        const int bar = H / 5;
+        for (int y = 0; y < H; ++y) {
+            if (y >= bar && y < H - bar)
+                continue;
+            for (int x = 0; x < W; ++x) {
+                float* q = &boxed[(static_cast<size_t>(y) * W + x) * 4];
+                q[0] = q[1] = q[2] = 0.0f;
+            }
+        }
+        nrcore::Stats sb;
+        nrcore::estimateInput(boxed.data(), nullptr, W, H, p, sb);
+        printf("letterbox: measured sigma %.4f vs true %.4f\n", sb.sy, truth);
+        check(std::fabs(sb.sy - truth) / truth < 0.30f,
+              "letterbox bars do not collapse the noise estimate");
     }
 
     // --- render every view mode

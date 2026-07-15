@@ -169,6 +169,7 @@ struct AutoSettings {
     float spatialLuma     = 60.0f;
     float spatialChroma   = 100.0f;
     float preserveDetail  = 35.0f;
+    float detailRescue    = 0.0f;   // v3.1
     float chromaBlotch    = 25.0f;
     float eqFine          = 100.0f;
     float eqMedium        = 0.0f;
@@ -188,22 +189,28 @@ inline AutoSettings mapAnalysisToSettings(const ClipAggregate& a)
     s.movingCamera = (a.motion > 0.15f) ? 1 : 0;
 
     // Base table per class. Values are monotone in the class so "noisier
-    // footage never gets gentler settings" holds by construction. The
-    // moderate row IS the plugin's defaults (they are tuned for moderate
-    // footage); clean keeps near-default strengths — the filter's h already
-    // scales with the measured sigma, so on clean footage the protective
-    // moves are the smaller radius and higher Preserve Detail, not weak
-    // strengths that would just leave measurable noise behind.
-    static const float kTL[4]  = { 60, 60, 75, 90 };    // temporal luma
-    static const float kTC2[4] = { 80, 80, 95, 100 };   // temporal chroma
-    static const float kSL[4]  = { 60, 60, 70, 85 };    // spatial luma
-    static const float kSC2[4] = { 100, 100, 100, 100 };// spatial chroma
-    static const int   kR[4]   = { 3, 3, 4, 6 };        // search radius
-    static const int   kF[4]   = { 3, 3, 5, 5 };        // frames
-    static const float kPD[4]  = { 45, 35, 30, 20 };    // preserve detail
-    static const float kCB[4]  = { 25, 25, 40, 55 };    // chroma blotch
-    static const float kEM[4]  = { 0, 0, 15, 30 };      // medium band
-    static const float kEC[4]  = { 0, 0, 0, 15 };       // coarse luma band
+    // footage never gets gentler settings" holds by construction. Clean
+    // keeps the plugin defaults; from moderate up, v3.1 deliberately uses
+    // the extended ranges — field feedback was that Auto had to be beaten
+    // to reach Resolve's built-in NR. Detail Rescue rises with class so the
+    // extra aggression flattens noise without blurring structure.
+    // Tuned empirically against the synthetic-scene PSNR suite: the noise
+    // energy lives in the temporal stack, the bands and the reach — pushing
+    // the fine-band blend past ~85 buys smoothness that PSNR (and faces)
+    // pay for, so the fine band stays moderate and Detail Rescue climbs
+    // instead. The e2e tests gate every class against stock defaults.
+    static const float kTL[4]  = { 60, 70, 85, 100 };   // temporal luma
+    static const float kTC2[4] = { 80, 90, 105, 125 };  // temporal chroma
+    static const float kSL[4]  = { 60, 70, 80, 85 };    // spatial luma
+    static const float kSC2[4] = { 100, 110, 125, 150 };// spatial chroma
+    static const int   kR[4]   = { 3, 4, 5, 7 };        // search radius
+    static const int   kF[4]   = { 3, 5, 5, 5 };        // frames
+    static const float kPD[4]  = { 45, 35, 30, 15 };    // preserve detail
+    static const float kRS[4]  = { 0, 15, 40, 50 };     // detail rescue
+    static const float kCB[4]  = { 25, 35, 55, 80 };    // chroma blotch
+    static const float kEF[4]  = { 100, 100, 105, 110 };// fine band drive
+    static const float kEM[4]  = { 0, 10, 30, 50 };     // medium band
+    static const float kEC[4]  = { 0, 0, 10, 25 };      // coarse luma band
 
     const int c = s.noiseClass;
     s.temporalLuma   = kTL[c];
@@ -213,15 +220,18 @@ inline AutoSettings mapAnalysisToSettings(const ClipAggregate& a)
     s.spatialRadius  = kR[c];
     s.temporalFrames = kF[c];
     s.preserveDetail = kPD[c];
+    s.detailRescue   = kRS[c];
     s.chromaBlotch   = kCB[c];
+    s.eqFine         = kEF[c];
     s.eqMedium       = kEM[c];
     s.eqCoarse       = kEC[c];
 
     // Motion energy: heavy motion prefers 3 frames and a lower (more
-    // cautious) motion threshold; a quiet tripod shot can afford a higher
-    // one. Base rises with the noise class (noisier gates need more room).
+    // cautious) motion threshold. The base stays cautious even for noisy
+    // classes — sweeps show a wide gate buys almost nothing on static
+    // footage but visibly costs quality the moment anything moves.
     const float mNorm = std::min(a.motion / 0.4f, 1.0f);
-    s.motionThresh = clampfLocal(30.0f + 5.0f * c - 20.0f * mNorm, 12.0f, 45.0f);
+    s.motionThresh = clampfLocal(26.0f + 4.0f * c - 18.0f * mNorm, 12.0f, 40.0f);
     if (a.motion > 0.15f)
         s.temporalFrames = 3;
 
@@ -229,7 +239,7 @@ inline AutoSettings mapAnalysisToSettings(const ClipAggregate& a)
     // blotch radius scales with the slider, and the rings must clear the
     // stain to see clean context, so heavy chroma noise wants it well up.
     if (a.chromaRatio > 1.6f) {
-        s.spatialChroma = 100.0f;
+        s.spatialChroma = std::max(s.spatialChroma, 125.0f);
         s.chromaBlotch += 20.0f;
     }
     if (a.chromaRatio > 2.5f)
@@ -247,9 +257,9 @@ inline AutoSettings mapAnalysisToSettings(const ClipAggregate& a)
         s.eqCoarse += 10.0f;
     }
 
-    s.chromaBlotch = clampfLocal(s.chromaBlotch, 0.0f, 100.0f);
-    s.eqMedium     = clampfLocal(s.eqMedium, 0.0f, 100.0f);
-    s.eqCoarse     = clampfLocal(s.eqCoarse, 0.0f, 100.0f);
+    s.chromaBlotch = clampfLocal(s.chromaBlotch, 0.0f, 150.0f);
+    s.eqMedium     = clampfLocal(s.eqMedium, 0.0f, 150.0f);
+    s.eqCoarse     = clampfLocal(s.eqCoarse, 0.0f, 150.0f);
     return s;
 }
 

@@ -49,9 +49,9 @@ typedef struct NRParams
     // ---- v3 ----
     int   motionTracking;  // temporal shift-search matching (0/1)
     int   fireflyRemoval;  // 3-frame temporal median impulse clip (0/1)
-    float eqFine;          // Noise EQ: fine band gain, 0..2 (1 = v2.1)
-    float eqMedium;        // Noise EQ: medium band amount, 0..1
-    float eqCoarse;        // Noise EQ: coarse band LUMA amount, 0..1
+    float eqFine;          // Noise EQ: fine band gain, 0..3 (1 = v2.1)
+    float eqMedium;        // Noise EQ: medium band amount, 0..1.5
+    float eqCoarse;        // Noise EQ: coarse band LUMA amount, 0..1.5
     float deband;          // gradient-aware debanding, 0..1
     int   profileLocked;   // 1 = use lock* values instead of measuring
     float lockSY;          // locked input profile (spatial pair)
@@ -60,6 +60,12 @@ typedef struct NRParams
     float lockTC;
     float lockGainY[16];   // locked brightness-dependent gains
     float lockGainC[16];
+
+    // ---- v3.1 ----
+    float detailRescue;    // 0..1: restore fine-band changes beyond noise size
+    int   scopeMeasure;    // overlay: Noise Analysis panel (0/1)
+    int   scopeMotion;     // overlay: temporal-activity mini map (0/1)
+    int   scopeEq;         // overlay: Noise EQ panel (0/1)
 } NRParams;
 
 // stats buffer layout (uint32 slots)
@@ -85,6 +91,9 @@ typedef struct NRParams
 #define NR_STATS_GAINY      4136     // 16 float-bit gains
 #define NR_STATS_GAINC      4152     // 16 float-bit gains
 #define NR_STATS_EFFN_MED   4168
+#define NR_STATS_FINE_Y     4169     // v3.1: per-band estimates for the EQ
+#define NR_STATS_FINE_C     4170     //       scope (float bits)
+#define NR_STATS_COARSE_Y   4171
 #define NR_STATS_UINTS      4176
 
 #endif // OPENNR_NRPARAMS_H

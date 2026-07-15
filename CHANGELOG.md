@@ -1,5 +1,59 @@
 # OpenNR changelog
 
+## 3.1.0 — 2026-07-15
+
+The power & transparency release, built from field feedback: "only when I
+cranked every value could I get close to Resolve's built-in NR" — and the
+cranked result was smoother *and blurrier*. v3.1 fixes both halves.
+
+### More power
+- **Detail Rescue (Step 3) — smoothing without blur.** After the spatial
+  stage, anything it changed by more than a noise-sized amount is put back.
+  Crank Luma Strength / EQ Fine as hard as you like: flats and faces go
+  buttery while edges physically cannot blur (the worst case is bounded by
+  construction). At full crank it recovers +3.5 dB on the test scene. Auto
+  Setup raises it with the noise class.
+- **Every range extended, and the dead zones fixed.** Strength to 3.0,
+  spatial Luma/Chroma to 150, temporal strengths to 125 (matching neighbours
+  may now outweigh the current frame), Motion Threshold to 150, Search Radius
+  to 10, EQ Fine to 300 — and above 150 it now genuinely smooths harder
+  (before, the blend saturated and the top of the slider was a silent no-op).
+  Band sliders (Clumps / Stains / Color Blotches) reach 150: the applied
+  amount caps at 1, the extra drive widens tolerances and reach instead
+  (color blotch reach up to ~23 px, luma stains to ~47 px).
+- **Auto Setup is much bolder.** New per-class tables use the extended
+  ranges: on the synthetic suite, auto now beats stock defaults by +2.8 dB
+  (moderate), +5.0 dB (noisy), +2.0 dB (blotchy) — every class gated by
+  tests to never be worse. The temporal gate stays deliberately cautious
+  (sweeps showed wide gates buy ~nothing on static shots and visibly hurt
+  the moment anything moves).
+- **Letterbox bars and crushed blacks no longer sabotage the measurement.**
+  Exactly-flat samples (bit-identical to all neighbours — real sensor pixels
+  never are) are skipped by every estimator. Letterboxed footage used to
+  collapse the measured sigma toward zero and quietly under-filter.
+
+### More transparency
+- **Per-step scopes, as checkboxes where you need them.** Step 1 "Scope:
+  Measurements", Step 2 "Scope: Motion Map" (a live picture-in-picture
+  mini-map — green = frames stacking, red = motion-protected), Step 3
+  "Scope: Noise EQ". Scopes draw over ANY view, combine freely, and never
+  touch alpha.
+- **The Noise EQ finally explains itself.** The four band sliders moved into
+  a labeled "Noise EQ · Cut Noise By Size" subgroup with plain-size names
+  (Fine Grain ~1 px / Clumps 3–8 px / Stains 16 px+ / Color Blotches), and
+  the first time you touch one, the EQ scope pops up in the viewer: one lane
+  per band, the bar is how much you're cutting, the amber line is how much
+  noise was measured at that size.
+- **Analysis panel rebuilt.** 2× text on an opaque panel (the old 1-px font
+  strokes decimated into garbage below 100% viewer zoom), plain-English
+  labels (INPUT / RESIDUAL / AVG FRAMES / MEASURING LIVE vs PROFILE LOCKED),
+  and a sqrt-scaled histogram so one dominant bin can't flatten the display.
+- **Noise Removed view no longer looks like mistakes.** The gain now rides
+  the measured noise level (clean footage still reads) and a soft knee
+  compresses big legitimate changes — bokeh lights and motion no longer slam
+  into hard black/white blobs.
+- Every tooltip rewritten down to one or two sentences.
+
 ## 3.0.0 — 2026-07-15
 
 The intelligence release: the plugin now measures your footage and sets

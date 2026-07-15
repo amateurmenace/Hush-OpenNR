@@ -33,22 +33,20 @@
 #define kPluginName "Hush Open NR"
 #define kPluginGrouping "Hush"
 #define kPluginDescription \
-    "Hush Open NR v3.0 — the free noise reduction suite.\n\n" \
-    "New: click AUTO SETUP and the plugin analyzes your clip (noise level, " \
-    "chroma character, motion) and dials in every slider for you — then you " \
-    "adjust from there. One Cmd+Z (or the Revert button) undoes it.\n\n" \
-    "Work top to bottom: 1) measure the noise (automatic, from a region, or " \
-    "manual — and lock the measured profile so it stops re-measuring), " \
-    "2) temporal NR averages matching pixels across frames, with motion " \
-    "tracking and a firefly zapper, 3) spatial NR cleans what remains with a " \
-    "three-band Noise EQ, 4) refine the finish (shadow desaturation, texture, " \
-    "debanding, film grain), 5) inspect with the analysis views.\n\n" \
-    "Open Step 5 and choose 'Noise Analysis' to SEE the measured noise levels " \
-    "on screen, or 'Noise Only' to see exactly what is being removed.\n\n" \
+    "Hush Open NR v3.1 — the free noise reduction suite.\n\n" \
+    "Click AUTO SETUP and the plugin measures your clip and dials in every " \
+    "slider (one undo reverts). Work top to bottom: 1 measure, 2 temporal, " \
+    "3 spatial, 4 refine, 5 inspect.\n\n" \
+    "New in 3.1: every range goes further, Auto Setup is bolder, and DETAIL " \
+    "RESCUE lets you crank the smoothing without blurring — anything the " \
+    "filter changed by more than a noise-sized amount is put back.\n\n" \
+    "Each step has a Scope checkbox that draws a panel right in the viewer — " \
+    "measurements, the Noise EQ bands, the motion map — so you can see what " \
+    "the plugin sees. Turn scopes off before rendering.\n\n" \
     "MIT-licensed and free forever."
 #define kPluginIdentifier "org.opennr.Denoise"
 #define kPluginVersionMajor 3
-#define kPluginVersionMinor 0
+#define kPluginVersionMinor 1
 
 #define kSupportsTiles false
 #define kSupportsMultiResolution false
@@ -174,10 +172,14 @@ public:
         m_SpatialLuma    = fetchDoubleParam("spatialLuma");
         m_SpatialChroma  = fetchDoubleParam("spatialChroma");
         m_PreserveDetail = fetchDoubleParam("preserveDetail");
+        m_DetailRescue   = fetchDoubleParam("detailRescue");
         m_ChromaBlotch   = fetchDoubleParam("chromaBlotch");
         m_EqFine         = fetchDoubleParam("eqFine");
         m_EqMedium       = fetchDoubleParam("eqMedium");
         m_EqCoarse       = fetchDoubleParam("eqCoarse");
+        m_ScopeMeasure   = fetchBooleanParam("scopeMeasure");
+        m_ScopeMotion    = fetchBooleanParam("scopeMotion");
+        m_ScopeEq        = fetchBooleanParam("scopeEq");
         m_EnableRefine   = fetchBooleanParam("enableRefine");
         m_ShadowDesat    = fetchDoubleParam("shadowDesat");
         m_DesatRange     = fetchDoubleParam("desatRange");
@@ -215,6 +217,10 @@ public:
         int view = 0;
         m_ViewMode->getValueAtTime(t, view);
         if (view != 0)
+            return false;
+        // v3.1: scope overlays must render even when the filters are neutral
+        if (m_ScopeMeasure->getValueAtTime(t) || m_ScopeMotion->getValueAtTime(t) ||
+            m_ScopeEq->getValueAtTime(t))
             return false;
 
         const double master = m_Master->getValueAtTime(t);
@@ -261,6 +267,20 @@ public:
                 revertAutoSetup();
             else if (p_ParamName == "lockProfile")
                 lockProfileToggled(p_Args.time);
+
+            // v3.1: the first manual touch of a Noise EQ control pops the EQ
+            // scope so the user can SEE what the bands do. Once per instance —
+            // if they close it, it stays closed.
+            if (!m_EqScopeShown &&
+                (p_ParamName == "eqFine" || p_ParamName == "eqMedium" ||
+                 p_ParamName == "eqCoarse" || p_ParamName == "chromaBlotch"))
+            {
+                m_EqScopeShown = true;
+                bool on = false;
+                m_ScopeEq->getValue(on);
+                if (!on)
+                    m_ScopeEq->setValue(true);
+            }
         }
 
         if (p_ParamName == "profileSource" || p_ParamName == "enableTemporal" ||
@@ -382,13 +402,13 @@ private:
         m_LockData->getValue(lockStr);
         snprintf(buf, sizeof(buf),
                  "v1|et=%d|tf=%d|tl=%.17g|tc=%.17g|mt=%.17g|mtr=%d|ff=%d|es=%d|sm=%d|sr=%d|"
-                 "sl=%.17g|sc=%.17g|pd=%.17g|cb=%.17g|eqf=%.17g|eqm=%.17g|eqc=%.17g|pa=%.17g|lp=%d|ld=%s",
+                 "sl=%.17g|sc=%.17g|pd=%.17g|rs=%.17g|cb=%.17g|eqf=%.17g|eqm=%.17g|eqc=%.17g|pa=%.17g|lp=%d|ld=%s",
                  m_EnableTemporal->getValue() ? 1 : 0, tf,
                  m_TemporalLuma->getValue(), m_TemporalChroma->getValue(), m_MotionThresh->getValue(),
                  m_MotionTracking->getValue() ? 1 : 0, m_FireflyRemoval->getValue() ? 1 : 0,
                  m_EnableSpatial->getValue() ? 1 : 0, sm, m_SpatialRadius->getValue(),
                  m_SpatialLuma->getValue(), m_SpatialChroma->getValue(),
-                 m_PreserveDetail->getValue(), m_ChromaBlotch->getValue(),
+                 m_PreserveDetail->getValue(), m_DetailRescue->getValue(), m_ChromaBlotch->getValue(),
                  m_EqFine->getValue(), m_EqMedium->getValue(), m_EqCoarse->getValue(),
                  m_ProfileAdjust->getValue(), m_LockProfile->getValue() ? 1 : 0,
                  lockStr.c_str());
@@ -439,6 +459,7 @@ private:
         m_SpatialLuma->setValue(as.spatialLuma);
         m_SpatialChroma->setValue(as.spatialChroma);
         m_PreserveDetail->setValue(as.preserveDetail);
+        m_DetailRescue->setValue(as.detailRescue);
         m_ChromaBlotch->setValue(as.chromaBlotch);
         m_EqFine->setValue(as.eqFine);
         m_EqMedium->setValue(as.eqMedium);
@@ -481,6 +502,7 @@ private:
         if (snapField(s, "sl", v))  m_SpatialLuma->setValue(atof(v.c_str()));
         if (snapField(s, "sc", v))  m_SpatialChroma->setValue(atof(v.c_str()));
         if (snapField(s, "pd", v))  m_PreserveDetail->setValue(atof(v.c_str()));
+        if (snapField(s, "rs", v))  m_DetailRescue->setValue(atof(v.c_str()));
         if (snapField(s, "cb", v))  m_ChromaBlotch->setValue(atof(v.c_str()));
         if (snapField(s, "eqf", v)) m_EqFine->setValue(atof(v.c_str()));
         if (snapField(s, "eqm", v)) m_EqMedium->setValue(atof(v.c_str()));
@@ -564,6 +586,7 @@ private:
         m_SpatialLuma->setEnabled(sOn);
         m_SpatialChroma->setEnabled(sOn);
         m_PreserveDetail->setEnabled(sOn);
+        m_DetailRescue->setEnabled(sOn);
         m_ChromaBlotch->setEnabled(sOn);
         m_EqFine->setEnabled(sOn);
         m_EqMedium->setEnabled(sOn);
@@ -632,6 +655,12 @@ private:
         p.eqMedium        = static_cast<float>(m_EqMedium->getValueAtTime(t) / 100.0);
         p.eqCoarse        = static_cast<float>(m_EqCoarse->getValueAtTime(t) / 100.0);
         p.deband          = static_cast<float>(m_Deband->getValueAtTime(t) / 100.0);
+
+        // ---- v3.1 ----
+        p.detailRescue    = static_cast<float>(m_DetailRescue->getValueAtTime(t) / 100.0);
+        p.scopeMeasure    = m_ScopeMeasure->getValueAtTime(t) ? 1 : 0;
+        p.scopeMotion     = m_ScopeMotion->getValueAtTime(t) ? 1 : 0;
+        p.scopeEq         = m_ScopeEq->getValueAtTime(t) ? 1 : 0;
         const bool locked = m_LockProfile->getValueAtTime(t) && m_LockValid;
         p.profileLocked   = locked ? 1 : 0;
         p.lockSY = locked ? m_LockAgg.sy : 0.02f;
@@ -748,6 +777,10 @@ private:
         p.eqMedium       = params.eqMedium;
         p.eqCoarse       = params.eqCoarse;
         p.deband         = params.deband;
+        p.detailRescue   = params.detailRescue;
+        p.scopeMeasure   = params.scopeMeasure;
+        p.scopeMotion    = params.scopeMotion;
+        p.scopeEq        = params.scopeEq;
         p.profileLocked  = params.profileLocked;
         p.lockSY         = params.lockSY;
         p.lockSC         = params.lockSC;
@@ -833,7 +866,12 @@ private:
     OFX::DoubleParam*  m_SpatialLuma = nullptr;
     OFX::DoubleParam*  m_SpatialChroma = nullptr;
     OFX::DoubleParam*  m_PreserveDetail = nullptr;
+    OFX::DoubleParam*  m_DetailRescue = nullptr;
     OFX::DoubleParam*  m_ChromaBlotch = nullptr;
+    OFX::BooleanParam* m_ScopeMeasure = nullptr;
+    OFX::BooleanParam* m_ScopeMotion = nullptr;
+    OFX::BooleanParam* m_ScopeEq = nullptr;
+    bool m_EqScopeShown = false;
     OFX::BooleanParam* m_EnableRefine = nullptr;
     OFX::DoubleParam*  m_ShadowDesat = nullptr;
     OFX::DoubleParam*  m_DesatRange = nullptr;
@@ -1080,24 +1118,17 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
 
     // ------------------------------------------------------------------ master
     defineDouble(p_Desc, page, "master", "Strength",
-                 "Overall amount of noise reduction. Below 1.0 it fades the effect in and out. "
-                 "Above 1.0 it goes further: the filters widen what they treat as noise, so a "
-                 "Strength of 2 genuinely removes more than 1 (use for very noisy footage). "
-                 "0 = off. Start here.",
-                 1.0, 0.0, 2.0, nullptr);
+                 "Overall amount. Below 1 fades the effect; above 1 the filters widen what "
+                 "they treat as noise — up to 3 for very noisy footage. 0 = off.",
+                 1.0, 0.0, 3.0, nullptr);
 
     // ------------------------------------------------------------- auto setup
     {
         OFX::PushButtonParamDescriptor* b = p_Desc.definePushButtonParam("autoSetup");
         b->setLabels("Auto Setup (Analyze Footage)", "Auto Setup (Analyze Footage)", "Auto Setup");
-        b->setHint("Analyzes this clip — noise level, chroma character, spatial correlation "
-                   "and camera motion, measured on several frames spread across the clip — "
-                   "then writes the best settings into the sliders below and locks the "
-                   "measured noise profile.\n\n"
-                   "This is not a mode: afterwards everything is ordinary manual state, so "
-                   "dial any slider in or back from what it chose. One undo (or the Revert "
-                   "button) restores everything. Your Step 4 look choices (grain, texture, "
-                   "desaturation, debanding) and the View are never touched.");
+        b->setHint("Measures the clip (noise, chroma, motion) and sets every slider below, "
+                   "then you adjust from there. One undo — or the Revert button — restores "
+                   "everything; your Step 4 look and the views are never touched.");
         page->addChild(*b);
     }
     {
@@ -1112,8 +1143,7 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     {
         OFX::PushButtonParamDescriptor* b = p_Desc.definePushButtonParam("revertAutoSetup");
         b->setLabels("Revert Auto Setup", "Revert Auto Setup", "Revert Auto");
-        b->setHint("Puts every denoise control back to its value from just before the last "
-                   "Auto Setup (a plain undo right after Auto Setup does the same thing).");
+        b->setHint("Restores every denoise control to its value from before the last Auto Setup.");
         page->addChild(*b);
     }
     {
@@ -1129,20 +1159,15 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     OFX::GroupParamDescriptor* grpProfile = p_Desc.defineGroupParam("grpProfile");
     grpProfile->setLabels("Step 1 · Measure The Noise", "Step 1 · Measure The Noise", "1 · Measure");
     grpProfile->setOpen(true);
-    grpProfile->setHint("Everything else is calibrated from the measured noise level. "
-                        "Check the measurement any time with Step 4 > View > Noise Analysis.");
+    grpProfile->setHint("Every filter is calibrated from this measurement. Tick the Scope "
+                        "checkbox to see it live in the viewer.");
 
     {
         OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("profileSource");
         c->setLabels("Noise Profile", "Noise Profile", "Profile");
-        c->setHint("How the noise level is determined.\n\n"
-                   "Automatic: measures every frame using frame-to-frame differences plus two "
-                   "spatial estimators — works for most footage.\n\n"
-                   "Automatic (From Region): same, but measured only inside a rectangle you place "
-                   "over a flat area (wall, sky, gray card). Drag the rectangle right in the viewer "
-                   "(enable the OpenFX overlay in the viewer's on-screen-controls menu), drag a "
-                   "corner to resize — or use the sliders below and the Noise Analysis view.\n\n"
-                   "Manual: type the noise levels yourself using the two sliders below.");
+        c->setHint("Where the noise level comes from: measured on the whole frame, measured "
+                   "only inside the draggable yellow rectangle (put it on a flat area), or "
+                   "typed in manually.");
         c->appendOption("Automatic (Whole Frame)");
         c->appendOption("Automatic (From Region)");
         c->appendOption("Manual");
@@ -1151,32 +1176,30 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
         page->addChild(*c);
     }
     defineDouble(p_Desc, page, "regionCenterX", "Region Center X",
-                 "Horizontal center of the measurement region (0 = left edge, 1 = right edge). "
-                 "See the yellow rectangle in the Noise Analysis view.", 0.5, 0.0, 1.0, grpProfile);
+                 "Horizontal center of the measurement region (0 = left, 1 = right). "
+                 "Easier: drag the yellow rectangle in the viewer.", 0.5, 0.0, 1.0, grpProfile);
     defineDouble(p_Desc, page, "regionCenterY", "Region Center Y",
-                 "Vertical center of the measurement region (0 = bottom, 1 = top). Easier: drag the rectangle in the viewer.", 0.5, 0.0, 1.0, grpProfile);
+                 "Vertical center of the measurement region (0 = bottom, 1 = top).", 0.5, 0.0, 1.0, grpProfile);
     defineDouble(p_Desc, page, "regionSize", "Region Size",
                  "Size of the measurement region relative to the frame.", 0.25, 0.05, 1.0, grpProfile);
     defineDouble(p_Desc, page, "profileAdjust", "Auto Profile Adjust",
-                 "Fine-tunes the automatic measurement. 1.0 = trust it as-is. Raise if noise is left "
-                 "behind (the filters think the footage is cleaner than it is); lower if detail is "
-                 "getting eaten. Check the result in the Noise Only view.",
-                 1.0, 0.25, 4.0, grpProfile);
+                 "Scales the automatic measurement. Raise if noise is left behind, lower if "
+                 "detail is being eaten.",
+                 1.0, 0.25, 6.0, grpProfile);
     defineDouble(p_Desc, page, "sigmaLuma", "Manual Luma Noise (%)",
-                 "Noise level of the brightness channel, as a percentage of full signal range. Only "
-                 "used when Noise Profile is set to Manual. Typical clean footage: 0.5–1. Visibly "
-                 "noisy: 2–5. Very noisy low light: 5–10.", 2.0, 0.05, 25.0, grpProfile);
+                 "Brightness-noise level in percent (Manual profile only). Clean 0.5–1, "
+                 "noisy 2–5, low light 5–10.", 2.0, 0.05, 40.0, grpProfile);
     defineDouble(p_Desc, page, "sigmaChroma", "Manual Chroma Noise (%)",
-                 "Noise level of the color channels (the colored speckle). Only used when Noise "
-                 "Profile is set to Manual.", 2.0, 0.05, 25.0, grpProfile);
+                 "Color-noise level in percent (Manual profile only).", 2.0, 0.05, 40.0, grpProfile);
     defineBool(p_Desc, page, "lockProfile", "Lock Profile",
-               "Measures the noise on several frames spread across the clip, then freezes that "
-               "profile (both sigma pairs and the brightness curve) so every frame filters "
-               "against the same numbers instead of re-measuring per frame.\n\n"
-               "Lock when a clip flickers between shots of different content (per-frame "
-               "measurement can breathe) or when you want renders to be repeatable. The "
-               "analysis HUD shows LOCKED while active; its histogram stays live so you can "
-               "compare. Un-tick to go back to per-frame measurement. Saved with the project.",
+               "Freezes the noise profile, averaged across the clip, so every frame filters "
+               "against the same numbers. Lock for repeatable renders or flickering content; "
+               "saved with the project.",
+               false, grpProfile);
+    defineBool(p_Desc, page, "scopeMeasure", "Scope: Measurements",
+               "Draws the measurement panel in the viewer: noise levels in and after Step 2, "
+               "frames averaged, SNR gain, the noise-vs-brightness curve and the histogram. "
+               "Turn off before rendering.",
                false, grpProfile);
     {
         OFX::StringParamDescriptor* s = p_Desc.defineStringParam("lockedProfileData");
@@ -1190,20 +1213,17 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     OFX::GroupParamDescriptor* grpTemporal = p_Desc.defineGroupParam("grpTemporal");
     grpTemporal->setLabels("Step 2 · Temporal NR (Across Frames)", "Step 2 · Temporal NR", "2 · Temporal");
     grpTemporal->setOpen(true);
-    grpTemporal->setHint("Averages each pixel with the same pixel in neighboring frames — the most "
-                         "effective and detail-safe reduction, but only where nothing is moving. "
-                         "Motion is detected automatically and those areas are left to Step 3. "
-                         "See where it is working with Step 4 > View > Temporal Activity.");
+    grpTemporal->setHint("Averages matching pixels across neighboring frames — the most "
+                         "detail-safe reduction. Moving areas are protected automatically "
+                         "and left to Step 3; tick the Scope to see where.");
 
     defineBool(p_Desc, page, "enableTemporal", "Enable Temporal NR",
-               "Toggle the across-frames stage on/off to see its contribution. "
-               "Turn off for still images or single-frame clips.",
+               "Toggle the across-frames stage to see its contribution. Off for stills.",
                true, grpTemporal);
     {
         OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("temporalFrames");
         c->setLabels("Number of Frames", "Number of Frames", "Frames");
-        c->setHint("How many frames are compared and averaged. 5 frames removes more noise in "
-                   "static areas but renders slower. 3 frames is a good default.");
+        c->setHint("5 frames removes more noise on static areas, renders slower.");
         c->appendOption("3 Frames");
         c->appendOption("5 Frames");
         c->setDefault(0);
@@ -1211,50 +1231,45 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
         page->addChild(*c);
     }
     defineBool(p_Desc, page, "motionTracking", "Motion Tracking",
-               "Before deciding whether a neighboring frame matches, tries shifting its patch "
-               "by up to 2 pixels and uses the best alignment. Slow pans and handheld drift "
-               "keep their across-frames averaging instead of falling back to spatial-only.\n\n"
-               "Leave on for almost everything; turn off for a small speed gain on locked-off "
-               "tripod footage (where it has nothing to find). Motion faster than ~2 px/frame "
-               "is still protected by the gate exactly as before.",
+               "Re-aims each neighbor frame by up to 2 px so slow pans and handheld drift "
+               "keep their across-frames averaging. Leave on.",
                true, grpTemporal);
     defineDouble(p_Desc, page, "temporalLuma", "Luma Strength",
-                 "How strongly brightness noise is averaged across frames (0–100).", 60.0, 0.0, 100.0, grpTemporal);
+                 "Brightness averaging strength. Above 100, matching neighbors outweigh the "
+                 "current frame — maximum smoothing on static areas.", 60.0, 0.0, 125.0, grpTemporal);
     defineDouble(p_Desc, page, "temporalChroma", "Chroma Strength",
-                 "How strongly color noise is averaged across frames. Color can take more than "
-                 "brightness without visible side effects.", 80.0, 0.0, 100.0, grpTemporal);
+                 "Color averaging strength; color takes more than brightness without side "
+                 "effects.", 80.0, 0.0, 125.0, grpTemporal);
     defineDouble(p_Desc, page, "motionThreshold", "Motion Threshold",
-                 "How much frame-to-frame change counts as motion, relative to the measured noise. "
-                 "The gate closes to exactly zero past this point, so pixels that changed are never "
-                 "blended. Low = cautious (less reduction near movement), high = stronger reduction "
-                 "on near-static areas. If you see any trailing on motion, lower this first.",
-                 30.0, 0.0, 100.0, grpTemporal);
+                 "How much change counts as motion — past it a pixel is never blended, so "
+                 "ghosting is impossible. Lower if you see trails; raise for stronger "
+                 "averaging on near-static shots.",
+                 30.0, 0.0, 150.0, grpTemporal);
     defineBool(p_Desc, page, "fireflyRemoval", "Firefly Removal",
-               "Zaps single-frame impulses — hot pixels, sensor 'fireflies', stray sparkles — "
-               "by clipping them to the 3-frame temporal median. A pixel is only zapped when "
-               "it spikes hard against BOTH neighboring frames while those frames agree with "
-               "each other, and it is also an outlier within its own frame, so moving detail "
-               "is left alone.\n\n"
-               "Leave on; turn off only if legitimate one-frame flashes (strobes, muzzle "
-               "flashes, glints) lose their sparkle.",
+               "Removes single-frame hot pixels and sparkles. Three tests must agree, so "
+               "real moving detail is left alone; turn off only if strobes or glints lose "
+               "their one-frame flash.",
                true, grpTemporal);
+    defineBool(p_Desc, page, "scopeMotion", "Scope: Motion Map",
+               "Draws a live mini-map in the viewer: green where frames are being stacked, "
+               "red where motion protection kicked in. Turn off before rendering.",
+               false, grpTemporal);
 
     // ---------------------------------------------------------- step 3: spatial
     OFX::GroupParamDescriptor* grpSpatial = p_Desc.defineGroupParam("grpSpatial");
     grpSpatial->setLabels("Step 3 · Spatial NR (Within Frame)", "Step 3 · Spatial NR", "3 · Spatial");
     grpSpatial->setOpen(true);
-    grpSpatial->setHint("Cleans the noise that remains after Step 2 (and everything in moving areas) "
-                        "by averaging each pixel only with genuinely similar neighborhoods, which "
-                        "preserves edges and texture.");
+    grpSpatial->setHint("Cleans what remains after Step 2 — and everything in moving areas — "
+                        "by averaging each pixel only with genuinely similar neighborhoods.");
 
     defineBool(p_Desc, page, "enableSpatial", "Enable Spatial NR",
-               "Toggle the within-frame stage on/off to see its contribution.",
+               "Toggle the within-frame stage to see its contribution.",
                true, grpSpatial);
     {
         OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("spatialMethod");
         c->setLabels("Method", "Method", "Method");
-        c->setHint("Better (NLM) compares whole 3x3 patches — higher quality, keeps texture. "
-                   "Faster (Bilateral) compares single pixels — use it if playback is too slow.");
+        c->setHint("Better compares whole patches and keeps texture; Faster compares single "
+                   "pixels — use it if playback is too slow.");
         c->appendOption("Faster (Bilateral)");
         c->appendOption("Better (NLM)");
         c->setDefault(1);
@@ -1264,130 +1279,117 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     {
         OFX::IntParamDescriptor* i = p_Desc.defineIntParam("spatialRadius");
         i->setLabels("Search Radius", "Search Radius", "Radius");
-        i->setHint("How far (in pixels) to look for similar areas. Larger = smoother flat areas but "
-                   "slower rendering. 3 is a good default; go to 6-8 for very soft, very noisy sources.");
+        i->setHint("How far to look for similar areas. Bigger = smoother flats, slower "
+                   "renders; 6–10 for very noisy sources.");
         i->setDefault(3);
-        i->setRange(1, 8);
-        i->setDisplayRange(1, 8);
+        i->setRange(1, 10);
+        i->setDisplayRange(1, 10);
         i->setParent(*grpSpatial);
         page->addChild(*i);
     }
     defineDouble(p_Desc, page, "spatialLuma", "Luma Strength",
-                 "How much brightness noise to remove within the frame (0–100). Higher values both "
-                 "blend more of the filtered result AND filter more aggressively. Too high can look "
-                 "waxy — pair with Step 4's texture/grain to keep a filmic feel.", 60.0, 0.0, 100.0, grpSpatial);
+                 "Brightness smoothing strength. Above 100 the filter widens what it treats "
+                 "as noise — crank it and use Detail Rescue to keep edges.", 60.0, 0.0, 150.0, grpSpatial);
     defineDouble(p_Desc, page, "spatialChroma", "Chroma Strength",
-                 "How much color noise (speckle) to remove. Chroma tolerates maximum strength on "
-                 "most footage — 100 is the default for a reason.", 100.0, 0.0, 100.0, grpSpatial);
+                 "Color smoothing strength; color tolerates far more than brightness.",
+                 100.0, 0.0, 150.0, grpSpatial);
     defineDouble(p_Desc, page, "preserveDetail", "Preserve Detail",
-                 "Protects edges and texture: filtering is automatically reduced where the image has "
-                 "real structure above the measured noise floor. Raise if fine detail is softening; "
-                 "lower if edges stay noisy.", 35.0, 0.0, 100.0, grpSpatial);
-    defineDouble(p_Desc, page, "chromaBlotch", "Chroma Blotch Reduction",
-                 "A second, LARGE-radius color pass (up to 16 px) that reaches the big soft color "
-                 "stains that 4:2:0 compression leaves behind — the ones the normal search radius "
-                 "physically can't span. Guided by brightness so color never bleeds across edges. "
-                 "Raise for blotchy phone/low-light footage.", 25.0, 0.0, 100.0, grpSpatial);
-    defineDouble(p_Desc, page, "eqFine", "Noise EQ · Fine",
-                 "Band strength for pixel-scale noise — scales the main NLM/bilateral pass. "
-                 "100 = normal. Lower if fine texture is going waxy while you want the other "
-                 "bands to keep working; raise above 100 to lean harder on fine grain when "
-                 "the sliders above are already maxed.", 100.0, 0.0, 200.0, grpSpatial);
-    defineDouble(p_Desc, page, "eqMedium", "Noise EQ · Medium",
-                 "Band strength for mid-size noise clumps (roughly 3–8 px) — the chunky blotch "
-                 "left by heavy compression or in-camera NR, which the fine pass can't tell "
-                 "from detail. Off by default. Raise when noise looks like moving 'clumps' "
-                 "rather than fine grain; Auto Setup raises it when it measures spatially "
-                 "correlated noise.", 0.0, 0.0, 100.0, grpSpatial);
-    defineDouble(p_Desc, page, "eqCoarse", "Noise EQ · Coarse (Luma)",
-                 "Band strength for LARGE soft brightness stains (16 px and up, reaching to "
-                 "32 px) — the slow luma mottling severe compression leaves in skies and "
-                 "walls. Works on 4x4 block averages with a clipped correction, so real "
-                 "structure is untouched by more than a noise-sized amount. Off by default; "
-                 "raise on very compressed low-light footage.", 0.0, 0.0, 100.0, grpSpatial);
+                 "Backs the filter off where the image has real structure. Raise if fine "
+                 "detail softens; lower if edges stay noisy.", 35.0, 0.0, 100.0, grpSpatial);
+    defineDouble(p_Desc, page, "detailRescue", "Detail Rescue",
+                 "Puts back anything the smoothing changed by more than a noise-sized amount. "
+                 "Crank the strengths for smoothness, then raise this until faces and edges "
+                 "come back crisp — smoothing without blur. 0 = off.", 0.0, 0.0, 100.0, grpSpatial);
+
+    // Noise EQ subgroup: the spatial stage split by the SIZE of the noise
+    OFX::GroupParamDescriptor* grpEq = p_Desc.defineGroupParam("grpEq");
+    grpEq->setLabels("Noise EQ · Cut Noise By Size", "Noise EQ · Cut Noise By Size", "Noise EQ");
+    grpEq->setOpen(false);
+    grpEq->setParent(*grpSpatial);
+    grpEq->setHint("Noise comes in sizes: fine grain, mid-size clumps, large soft stains. "
+                   "Each slider cuts one size. Touch any of them and the EQ scope appears "
+                   "in the viewer so you can see where your footage's noise lives.");
+
+    defineDouble(p_Desc, page, "eqFine", "Fine Grain (~1 px)",
+                 "Pixel-size grain — the main pass. 100 = normal; above 100 it both blends "
+                 "more and smooths harder (the old no-op top half now works).",
+                 100.0, 0.0, 300.0, grpEq);
+    defineDouble(p_Desc, page, "eqMedium", "Clumps (3–8 px)",
+                 "Mid-size noise clumps left by compression or in-camera NR. Raise when the "
+                 "noise looks like moving blotches instead of grain.", 0.0, 0.0, 150.0, grpEq);
+    defineDouble(p_Desc, page, "eqCoarse", "Stains (16 px +)",
+                 "Large soft brightness stains in skies and walls from severe compression. "
+                 "Corrections are clipped to noise size, so structure is safe.", 0.0, 0.0, 150.0, grpEq);
+    defineDouble(p_Desc, page, "chromaBlotch", "Color Blotches",
+                 "Large soft COLOR stains that 4:2:0 compression leaves behind (reach up to "
+                 "~23 px). Brightness-guided, so color never bleeds across edges.", 25.0, 0.0, 150.0, grpEq);
+    defineBool(p_Desc, page, "scopeEq", "Scope: Noise EQ",
+               "Draws the EQ panel in the viewer: one lane per band — the bar is how much "
+               "you are cutting, the amber line is how much noise was measured at that size. "
+               "Appears automatically the first time you touch an EQ slider.",
+               false, grpEq);
 
     // ----------------------------------------------------------- step 4: refine
     OFX::GroupParamDescriptor* grpRefine = p_Desc.defineGroupParam("grpRefine");
     grpRefine->setLabels("Step 4 · Refine The Finish", "Step 4 · Refine", "4 · Refine");
     grpRefine->setOpen(true);
-    grpRefine->setHint("Finishing touches after denoising: hide remaining color noise in the "
-                       "shadows, bring back natural texture, or lay down clean synthetic film "
-                       "grain in place of the ugly noise you removed.");
+    grpRefine->setHint("Finishing touches: hide leftover shadow color noise, bring back "
+                       "texture, smooth banding, or lay down clean film grain.");
 
     defineBool(p_Desc, page, "enableRefine", "Enable Refinements",
-               "Toggle the whole finishing stage on/off to compare.",
+               "Toggle the finishing stage to compare.",
                true, grpRefine);
     defineDouble(p_Desc, page, "shadowDesat", "Shadow Desaturate",
-                 "Fades color saturation toward zero in the darkest tones (a saturation-vs-luma "
-                 "curve). Chroma noise lives in shadows — this hides what filtering can't remove, "
-                 "and reads as a clean, cinematic shadow rendering. Try 20–40 on noisy footage.",
+                 "Fades color out of the darkest tones — hides the chroma noise filtering "
+                 "can't reach and reads cinematic. Try 20–40 on noisy footage.",
                  0.0, 0.0, 100.0, grpRefine);
     defineDouble(p_Desc, page, "desatRange", "Desaturate Range",
-                 "How far up the tonal scale the shadow desaturation reaches (in luma, 0.02–0.5). "
-                 "Default 0.15 affects only true shadows.",
+                 "How far up the tonal scale the shadow desaturation reaches.",
                  0.15, 0.02, 0.5, grpRefine);
     defineDouble(p_Desc, page, "lumaTexture", "Luma Texture",
-                 "Re-injects a percentage of the ORIGINAL brightness texture (grain) into the "
-                 "denoised image — the color noise stays gone, but the image keeps its natural "
-                 "film-like energy. Try 15–30 instead of cranking strengths down.",
+                 "Re-injects a share of the original brightness grain — color noise stays "
+                 "gone, natural energy comes back. Try 15–30.",
                  0.0, 0.0, 100.0, grpRefine);
     defineDouble(p_Desc, page, "deband", "Deband",
-                 "Smooths banding — the visible stair-steps in skies and gradients that 8-bit "
-                 "sources (and denoising itself) can reveal — by averaging along the gradient "
-                 "within a banding-sized tolerance, plus an invisible micro-dither so any "
-                 "remaining step decorrelates. Real edges are rejected by the tolerance and "
-                 "never touched. 0 = off. Raise until the contours in flat gradients dissolve; "
-                 "it will not soften detail.",
+                 "Dissolves the stair-steps in skies and gradients; real edges are rejected "
+                 "by the banding-sized tolerance and never touched.",
                  0.0, 0.0, 100.0, grpRefine);
     defineDouble(p_Desc, page, "grainAmount", "Film Grain",
-                 "Adds clean, synthesized grain — soft, organic, animated per frame, strongest in "
-                 "the midtones like real film stock. The classic finishing move: remove the ugly "
-                 "noise, then lay down grain you chose.",
+                 "Clean synthesized grain, midtone-weighted like real stock and animated per "
+                 "frame — the classic finishing move.",
                  0.0, 0.0, 100.0, grpRefine);
     defineDouble(p_Desc, page, "grainSize", "Grain Size",
-                 "Grain particle size in pixels. 1 = fine 35mm-like, 3-4 = chunky 16mm feel. "
-                 "Scale up for UHD timelines.",
+                 "Particle size in pixels: 1 = fine 35mm, 3–4 = chunky 16mm. Scale up for UHD.",
                  1.6, 0.5, 6.0, grpRefine);
     defineDouble(p_Desc, page, "grainChroma", "Grain Color",
-                 "0 = pure monochrome grain (film-like). Higher adds independent color grain "
-                 "(digital-sensor character).",
+                 "0 = monochrome film-like grain; higher adds color grain (digital-sensor "
+                 "character).",
                  25.0, 0.0, 100.0, grpRefine);
 
     // ---------------------------------------------------------- step 5: inspect
     OFX::GroupParamDescriptor* grpOutput = p_Desc.defineGroupParam("grpOutput");
     grpOutput->setLabels("Step 5 · Inspect & Compare", "Step 5 · Inspect", "5 · Inspect");
     grpOutput->setOpen(true);
-    grpOutput->setHint("Views for checking what the plugin is measuring and doing. Set back to "
-                       "Result before rendering.");
+    grpOutput->setHint("Full-image views for judging the result (the per-step Scope "
+                       "checkboxes draw panels on top of any view). Set back to Result "
+                       "before rendering.");
 
     {
         OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("viewMode");
         c->setLabels("View", "View", "View");
-        c->setHint("Follow the image through the pipeline:\n\n"
-                   "Result: the finished frame.\n\n"
-                   "Split: input on the left, result on the right.\n\n"
-                   "Input: the untouched source, for flip-comparisons.\n\n"
-                   "After Temporal: the image after Step 2 only — see what the across-frames stage "
-                   "contributed before spatial filtering.\n\n"
-                   "Noise Removed: what denoising took out (amplified 4x around gray, excludes "
-                   "grain/refinements). Should look like pure static — visible faces or edges mean "
-                   "detail is being cut: lower strengths or raise Preserve Detail.\n\n"
-                   "Noise Analysis: live measurements — input noise (blue) and the residual left "
-                   "after temporal NR (amber) for luma and chroma, effective frames averaged, the "
-                   "SNR gain so far, the noise-vs-brightness curve, the noise histogram, and the "
-                   "measurement region rectangle.\n\n"
-                   "Temporal Activity: green = frame-averaging active, red = motion-protected.\n\n"
-                   "SNR Map: signal-to-noise per pixel — magenta where noise dominates (NR matters "
-                   "most), green where the image wins.\n\n"
-                   "Matte - Noisiness: the noise-dominance map written to BOTH the RGB and the "
-                   "alpha channel (white/opaque = noise dominates, black/transparent = the image "
-                   "wins) — feed it downstream as a key so later nodes treat noisy areas "
-                   "differently.");
+        c->setHint("Result / Split / Input for comparing; After Temporal shows Step 2 alone.\n\n"
+                   "Noise Removed shows what was taken out, auto-gained to the measured noise "
+                   "level with a soft knee — it should look like featureless static; faces or "
+                   "edges in it mean detail is being cut (raise Preserve Detail or Detail "
+                   "Rescue).\n\n"
+                   "Noise Analysis overlays the measurement scope; Temporal Activity and SNR "
+                   "Map are full-frame heat maps; the Matte writes the noise-dominance map "
+                   "into RGB and alpha for keying downstream.");
         c->appendOption("Result");
         c->appendOption("Split (Input | Result)");
         c->appendOption("Input (Original)");
         c->appendOption("After Temporal (Step 2 Only)");
-        c->appendOption("Noise Removed (Amplified)");
+        c->appendOption("Noise Removed (Auto Gain)");
         c->appendOption("Noise Analysis (Measurements)");
         c->appendOption("Temporal Activity (Green = Averaging)");
         c->appendOption("SNR Map (Magenta = Noisy)");

@@ -50,22 +50,33 @@ edges, fine checker texture and 2-px lines survive.*
   fireflies) are clipped to the 3-frame temporal median. Three independent
   tests must agree before a pixel is touched, so thin fast-moving detail
   survives.
-- **Noise EQ (v3)** — the spatial stage split into three bands with their own
-  strengths: Fine (pixel-scale NLM), Medium (3–8 px compression clumps) and
-  Coarse Luma (16–32 px stains), each removing its own scale only.
+- **Detail Rescue (v3.1) — smoothing without blur.** After the spatial stage,
+  anything it changed by more than a noise-sized amount is put back. Crank the
+  strengths as hard as you like: flats and faces go buttery while edges
+  physically cannot blur. Auto Setup raises it with the noise class.
+- **Noise EQ (v3, labeled in v3.1)** — the spatial stage split into bands by
+  the SIZE of the noise: Fine Grain (~1 px), Clumps (3–8 px), Stains (16 px+)
+  and Color Blotches, grouped under a "Cut Noise By Size" section. Touch any
+  band and the **EQ scope** pops up in the viewer — one lane per band, the bar
+  is how much you're cutting, the amber line is how much noise was measured at
+  that size.
+- **Extended ranges (v3.1)** — Strength to 3, spatial strengths to 150,
+  EQ Fine to 300 (its top half is no longer a silent no-op), search radius to
+  10, band sliders to 150 (extra drive widens tolerance and reach).
 - **Deband + noise matte (v3)** — gradient-aware debanding that never touches
   real edges, and a **Matte: Noisiness** view that writes the noise-dominance
   map to RGB + alpha for keying downstream.
-- **See everything** — the **Noise Analysis** view renders live measurements
-  into the viewer (spatial + temporal noise levels for luma and chroma, meter
-  bars, the noise histogram with its median marked); **Noise Only** shows
-  exactly what is being removed; **Temporal Activity** paints where
-  frame-averaging works (green) vs. where motion protection kicked in (red);
-  **Split** gives instant before/after. Resolve's own NR is a black box — this
-  one shows its work.
+- **Per-step scopes (v3.1)** — checkboxes where you need them: Step 1
+  **Measurements** (noise levels, residual, SNR gain, brightness curve,
+  histogram — rebuilt with 2× text so it stays readable at fit zoom), Step 2
+  **Motion Map** (live mini-map: green = frames stacking, red = protected),
+  Step 3 **Noise EQ**. Scopes draw over any view and combine freely.
+  **Noise Removed** shows exactly what is being taken out, auto-gained to the
+  measured noise level with a soft knee. Resolve's own NR is a black box —
+  this one shows its work.
 - **Step-by-step controls** — numbered sections (1 · Measure, 2 · Temporal,
-  3 · Spatial, 4 · Inspect) with per-stage **Enable toggles** so you can watch
-  each stage's contribution, and long-form tooltips on every control.
+  3 · Spatial, 4 · Refine, 5 · Inspect) with per-stage **Enable toggles**, and
+  short plain-English tooltips on every control.
 - **Temporal NR** — motion-adaptive averaging over 3 or 5 frames, gated
   against the measured noise floor. No ghosting: moving pixels fall back to
   spatial filtering automatically.
@@ -78,10 +89,12 @@ edges, fine checker texture and 2-px lines survive.*
 
 ## Performance
 
-Measured on an Apple M1 Max (`test/bench_metal.mm`), v3.0. The v3 bench feeds
-realistic frames (scene + per-frame noise) rather than v2.1's identical
-buffers, so numbers are not comparable to older tables. Motion Tracking (on
-by default) costs ~13% at defaults and can be toggled off.
+Measured on an Apple M1 Max (`test/bench_metal.mm`), v3.0 — unchanged in
+v3.1 at defaults (the new power is opt-in; cranked radius/EQ settings cost
+proportionally more). The v3 bench feeds realistic frames (scene + per-frame
+noise) rather than v2.1's identical buffers, so numbers are not comparable
+to older tables. Motion Tracking (on by default) costs ~13% at defaults and
+can be toggled off.
 
 | Resolution | Better (NLM, R3, 5 frames) | Better, panning footage | Faster (bilateral, R2, 3 frames) |
 |---|---|---|---|
@@ -95,14 +108,14 @@ Real-time UHD at maximum quality on Apple Silicon.
 ## Install
 
 ### macOS
-1. Download `OpenNR-3.0.0-macOS.pkg` and double-click it.
+1. Download `OpenNR-3.1.0-macOS.pkg` and double-click it.
    *(The package is not yet notarized: if macOS blocks it, right-click → Open,
    or approve it under System Settings → Privacy & Security → "Open Anyway".)*
 2. Restart DaVinci Resolve. If you had a previous OpenNR version, also delete
    Resolve's plugin scan cache so it rescans:
    `rm ~/Library/Application\ Support/Blackmagic\ Design/DaVinci\ Resolve/OFXPluginCacheV2.xml`
 
-Alternative (no installer): unzip `OpenNR-3.0.0-macOS.zip` and double-click
+Alternative (no installer): unzip `OpenNR-3.1.0-macOS.zip` and double-click
 `Install OpenNR (macOS).command`, or copy `OpenNR.ofx.bundle` into
 `/Library/OFX/Plugins/` yourself. If you copy a bundle that was downloaded or
 AirDropped, clear the quarantine flag or macOS will silently refuse to load it:
@@ -127,18 +140,18 @@ Copy `OpenNR.ofx.bundle` into `/usr/OFX/Plugins/`.
 
 ## Quick start (the four steps)
 
-1. Drop **OpenNR Denoise** on a node (Color page) or clip (Edit page). The
-   defaults are calibrated from the automatic noise measurement — most footage
-   is already improved at this point. Adjust **Strength** to taste.
-2. **Check the measurement**: Step 4 → View → **Noise Analysis**. You'll see
-   the measured spatial/temporal noise for luma and chroma on screen. If the
-   numbers look implausibly low for obviously noisy footage, raise
-   **Auto Profile Adjust** (Step 1) — or place the measurement region on a
-   flat area using **Automatic (From Region)**.
-3. **Check what's being removed**: View → **Noise Only**. Pure static = good.
-   Visible edges/faces = too aggressive: lower Strength or raise Preserve
-   Detail.
-4. Set View back to **Result**. Done.
+1. Drop **Hush Open NR** on a node (Color page) or clip (Edit page) and click
+   **Auto Setup** — it measures the clip and dials in every slider. Adjust
+   **Strength** to taste; one undo reverts the whole setup.
+2. **Check the measurement**: tick Step 1 → **Scope: Measurements**. If the
+   numbers read implausibly low for obviously noisy footage, raise **Auto
+   Profile Adjust** — or measure from a flat area with **Automatic (From
+   Region)**.
+3. **Check what's being removed**: Step 5 → View → **Noise Removed**.
+   Featureless static = good. Visible edges/faces = too aggressive: raise
+   **Preserve Detail** or **Detail Rescue** (which lets you keep the smoothing
+   AND the edges).
+4. Untick the scopes, set View back to **Result**. Done.
 
 **Colorists:** apply NR early in the node tree (pre-grade), as with Resolve's
 built-in NR — denoise before contrast/saturation expansion amplifies the noise.
@@ -151,33 +164,36 @@ Temporal Activity view) to understand what each is contributing.
 
 | Step | Control | What it does |
 |---|---|---|
-| — | **Strength** | Overall amount; scales every strength at once. 0 = off, 1 = normal, 2 = double. |
+| — | **Strength** | Overall amount; scales every strength at once. 0 = off, 1 = normal, up to 3 the filters widen what they treat as noise. |
 | — | **Auto Setup (Analyze Footage)** | Analyzes the clip and writes the best settings into the sliders below, then locks the profile. Everything stays manually adjustable; one undo reverts. |
 | — | Analysis | Read-only report of what the last Auto Setup measured and decided. |
 | — | Revert Auto Setup | Restores every denoise control to its pre-Auto-Setup value. |
 | 1 | **Noise Profile** | Automatic (whole frame) / Automatic (from region) / Manual. |
 | 1 | Region Center X/Y, Size | The measurement rectangle (visible in Noise Analysis view). Put it on a flat area. |
-| 1 | **Auto Profile Adjust** | Scales the automatic measurement (×0.25–×4). The escape hatch when the estimate reads low/high. |
+| 1 | **Auto Profile Adjust** | Scales the automatic measurement (×0.25–×6). The escape hatch when the estimate reads low/high. |
 | 1 | Manual Luma / Chroma Noise (%) | Direct noise levels, used only in Manual mode. Clean ≈ 0.5–1, noisy ≈ 2–5, low-light ≈ 5–10. |
-| 1 | **Lock Profile** | Measures across the clip and freezes the profile so every frame filters against the same numbers. HUD shows LOCKED; saved with the project. |
+| 1 | **Lock Profile** | Measures across the clip and freezes the profile so every frame filters against the same numbers. The scope shows LOCKED; saved with the project. |
+| 1 | **Scope: Measurements** | The measurement panel, drawn live in the viewer. |
 | 2 | **Enable Temporal NR** | Toggle the across-frames stage. |
 | 2 | Number of Frames | 3 or 5 frames averaged. |
-| 2 | **Motion Tracking** | Shift-search patch matching (±2 px) so slow pans keep their temporal averaging. On by default; off = v2.1 behavior and a small speed gain. |
-| 2 | Luma / Chroma Strength | Per-channel-type temporal blending. |
-| 2 | Motion Threshold | How much change counts as motion. Lower if you see ghosting. |
-| 2 | **Firefly Removal** | Clips single-frame impulses (hot pixels) to the temporal median. Turn off only if real one-frame flashes lose their sparkle. |
+| 2 | **Motion Tracking** | Shift-search patch matching (±2 px) so slow pans keep their temporal averaging. |
+| 2 | Luma / Chroma Strength | Temporal blending (0–125; above 100 matching neighbours outweigh the current frame). |
+| 2 | Motion Threshold | How much change counts as motion (0–150). Lower if you see ghosting. |
+| 2 | **Firefly Removal** | Clips single-frame impulses (hot pixels) to the temporal median. |
+| 2 | **Scope: Motion Map** | Live mini-map: green = frames stacking, red = motion-protected. |
 | 3 | **Enable Spatial NR** | Toggle the within-frame stage. |
 | 3 | Method | Better (NLM, patch-based) or Faster (bilateral). |
-| 3 | Search Radius | How far to look for similar patches (1–8 px). |
-| 3 | Luma / Chroma Strength | Per-channel-type spatial filtering. Chroma tolerates high values. |
+| 3 | Search Radius | How far to look for similar patches (1–10 px). |
+| 3 | Luma / Chroma Strength | Spatial filtering (0–150; above 100 the filter widens what counts as noise). |
 | 3 | Preserve Detail | Edge-aware protection of real structure. |
-| 3 | Chroma Blotch Reduction | Large-radius chroma pass for the big soft 4:2:0 color stains. |
-| 3 | **Noise EQ · Fine / Medium / Coarse** | Per-band strengths: pixel-scale grain / 3–8 px clumps / 16–32 px luma stains. Fine 100 = classic behavior; Medium and Coarse are off until you (or Auto Setup) need them. |
+| 3 | **Detail Rescue** | Restores anything the smoothing changed by more than a noise-sized amount — crank strengths, keep edges. |
+| 3 | **Noise EQ · Cut Noise By Size** | Fine Grain ~1 px (to 300) / Clumps 3–8 px / Stains 16 px+ / Color Blotches (each to 150). Touching one pops the EQ scope. |
+| 3 | **Scope: Noise EQ** | Per-band panel: bar = your cut, amber line = measured noise at that size. |
 | 4 | Shadow Desaturate, Desat Range | Saturation-vs-luma curve to hide chroma noise in shadows. |
 | 4 | Luma Texture | Re-injects original brightness texture after denoising. |
 | 4 | **Deband** | Gradient-aware banding smoother + micro-dither. Edges are never touched. |
 | 4 | Film Grain, Grain Size, Grain Color | Clean synthesized grain to finish. |
-| 5 | **View** | Result / Split / Input / After Temporal / Noise Removed / Noise Analysis / Temporal Activity / SNR Map / **Matte: Noisiness** (map in RGB + alpha, for keying downstream). |
+| 5 | **View** | Result / Split / Input / After Temporal / Noise Removed (auto gain) / Noise Analysis / Temporal Activity / SNR Map / **Matte: Noisiness** (map in RGB + alpha, for keying downstream). |
 
 ### Coming from Resolve Studio's NR palette?
 
