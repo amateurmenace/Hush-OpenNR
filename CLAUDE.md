@@ -154,7 +154,7 @@ conversion lines).
   cache records the scan result (`status="0"` = loaded). Same plugin identifier
   at a higher version wins over the installed copy.
 
-## Algorithm summary (v3.2)
+## Algorithm summary (v3.4)
 
 1. **Noise profiling** (`estimateInput` / NoiseEst+FinalizeStats kernels):
    strided 2×2 sampling into 256-bin histograms — fine |Laplacian| (Y, C),
@@ -166,20 +166,32 @@ conversion lines).
    derived in comments and verified by tests. Exactly-flat samples (letterbox
    bars, crushed blacks — zero Laplacian in all channels) are skipped (v3.1).
    Two sigma pairs result: σ_S (spatial) and σ_T (temporal gating).
-   **Lock Profile** freezes a raw clip-aggregated snapshot (region-aware since
-   v3.2); Auto Profile Adjust multiplies locked values at USE time, so the
-   trim keeps working while locked.
-2. **Temporal merge**: per-pixel 3×3 patch mean |diff| against ±1/±2 frames,
-   shift-search **Motion Tracking** (±2 px, 9 candidates, 1% acceptance
-   margin, steeper roll-off for shifted winners), **firefly zapper**
-   (3-frame temporal median, three tests must agree). **Hard-knee gate** —
-   full weight below lo = 1.128·σ_T, smoothstep to exactly 0 at
-   lo + (0.4+2.6·mt)·σ_T; no tail = no ghosting by construction. v3.2 adds
-   **Ghost Guard**: a second knee on the SIGNED patch mean (noise cancels
-   signed, σ_mean = √2σ/3; knee start 1.128σ_T ≈ 2.4σ_mean, span
-   thrMul·σ_T/2) — catches slow coherent motion the magnitude gate can't
-   see, ~0.01 dB cost on static. Chroma slaved to the luma gate. Outputs
-   YCbCr + effective sample count (effN).
+   **Lock Profile (v3.4 semantics)** freezes the PLAYHEAD measurement,
+   hardened by a tracked ±4-frame sweep (nr_analyze.h: SAD patch tracking
+   with zero-motion prior + drift cap; a sweep frame votes only if its σ and
+   patch brightness agree with the playhead's) — never a clip-spread median,
+   which was the "lock brings the noise back" bug. Auto Profile Adjust
+   multiplies locked values at USE time, so the trim keeps working while
+   locked. **Auto Region** (button) runs the flattest-patch scan at the
+   user's region size and MOVES the box (the only thing allowed to — Auto
+   Setup still only reports). Auto Setup in region mode: sigmas from the
+   tracked playhead sweep, motion from whole-frame spread frames.
+2. **Temporal merge**: per-pixel 3×3 patch mean |diff| against up to ±3
+   frames, hierarchical shift-search **Motion Tracking** (~±8 px: step-4
+   coarse grid on block means + converging ±1 refine, 1%/10% acceptance
+   margins, steeper roll-off for shifted winners), **firefly zapper**
+   (3-frame temporal median, three tests must agree; deliberately NOT
+   gain-scaled). **Hard-knee gate** — full weight below lo = 1.128·σ_T,
+   smoothstep to exactly 0 at lo + (0.4+2.6·mt)·σ_T; no tail = no ghosting
+   by construction. v3.4: knee, Ghost Guard and search-engagement thresholds
+   all scale with the centre pixel's 16-bin brightness gain (locked/manual/
+   live triple in the GPU kernels — the lock fast path skips FinalizeStats,
+   so locked gains come from params). **Ghost Guard** (v3.2): a second knee
+   on the SIGNED patch mean (noise cancels signed, σ_mean = √2σ/3; knee
+   start 1.128σ_T ≈ 2.4σ_mean, span thrMul·σ_T/2) — catches slow coherent
+   motion the magnitude gate can't see, ~0.01 dB cost on static. Chroma
+   gates per channel (v3.3 B5), slaved to the luma gate. Outputs YCbCr +
+   effective sample count (effN).
 3. **Residual re-measurement** on the merged image — at TWO scales since
    v3.2 (fine + even-aligned 2×2 block Laplacian, ry = max(fine, 0.9·coarse),
    capped at σ_S): compression blotch that survives the merge is larger than
@@ -210,7 +222,12 @@ Numbered steps teach the pipeline (1 Measure → 2 Temporal → 3 Spatial →
 4 Refine → 5 Inspect). Tooltips are 1–2 sentences (v3.1 cut them down from
 paragraphs). Per-stage Enable toggles show each stage's contribution;
 **Auto Setup** writes measured settings into the visible sliders (one-undo
-edit block); **Clean Slate** zeroes everything for fully-manual builds.
+edit block); **Auto Region** finds a flat patch and moves the sampling box
+(one-undo edit block; unlocks, since a new spot means live measurement);
+**Clean Slate** zeroes everything for fully-manual builds. The region box
+states its mode: yellow + handles + cross = live (re-measured every frame),
+dim ice blue + padlock + inert = locked (frozen; region sliders disabled —
+see updateEnabledness). Lock/unlock and Auto Region write the Analysis line.
 Scope checkboxes live in the step they explain, and the EQ scope auto-shows
 on the first manual touch of an EQ slider (once per instance,
 `m_EqScopeShown`). The viewer doubles as the scope because OFX can't draw

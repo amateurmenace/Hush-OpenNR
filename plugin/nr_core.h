@@ -718,6 +718,23 @@ inline void temporalMerge(const float* const frames[7], int W, int H,
                 }
             }
 
+            // v3.4: per-brightness gate calibration. The estimator measures a
+            // 16-bin "shadows are noisier" gain curve and the spatial stage
+            // has always used it per pixel — the temporal knees now do too:
+            // every threshold scales with the centre pixel's gain, so shadows
+            // (noisier) keep their averaging instead of reading as motion,
+            // and highlights gate tighter instead of ghosting. Flat curves
+            // (manual profile) make all of this exactly 1.0 — bit-exact with
+            // the ungained knee. The 6-sigma zapper stays unscaled on
+            // purpose: at that magnitude the curve's 0.6..2.2x cannot flip a
+            // genuine impulse, and an impulse corrupts its own bin anyway.
+            const int gLb = clampi(static_cast<int>(cy9[4] * static_cast<float>(kLumaBins)),
+                                   0, kLumaBins - 1);
+            const float gnY = s.gainY[gLb];
+            const float gnC = s.gainC[gLb];
+            const float invGnY = 1.0f / gnY;
+            const float invGnC = 1.0f / gnC;
+
             float accY = cy9[4], accCb = ccb9[4], accCr = ccr9[4];
             float sumWY = 1.0f, sumWY2 = 1.0f, sumWCb = 1.0f, sumWCr = 1.0f;
 
@@ -747,7 +764,7 @@ inline void temporalMerge(const float* const frames[7], int W, int H,
                 // misaligned detail. Ghost Guard gates the WINNER's signed
                 // mean, wherever the search lands.
                 float shiftTight = 1.0f;
-                if (track && dY > searchThresh) {
+                if (track && dY > searchThresh * gnY) {
                     int wx = 0, wy = 0;
                     // The coarse level runs only when the unshifted match is
                     // FULLY outside the knee (dY > hiY): its weight is
@@ -756,7 +773,7 @@ inline void temporalMerge(const float* const frames[7], int W, int H,
                     // searchThresh routinely but hiY rarely, never pay the
                     // 16-node block-mean sweep (measured: gating here
                     // returned the static-scene fps to the v3.2 level).
-                    if (dY > hiY) {
+                    if (dY > hiY * gnY) {
                         if (!haveCb9) {
                             int i = 0;
                             for (int dy = -1; dy <= 1; ++dy)
@@ -816,13 +833,13 @@ inline void temporalMerge(const float* const frames[7], int W, int H,
                     }
                 }
 
-                float gY = 1.0f - smooth01((dY - loY) * invSpanY * shiftTight);
+                float gY = 1.0f - smooth01((dY - loY * gnY) * invSpanY * invGnY * shiftTight);
                 if (guard)
-                    gY *= 1.0f - smooth01((std::fabs(sdY) - loS) * invSpanS * shiftTight);
+                    gY *= 1.0f - smooth01((std::fabs(sdY) - loS * gnY) * invSpanS * invGnY * shiftTight);
                 // v3.3 B5: each chroma channel gets its own gate against its
                 // own knee (both still slaved to the luma gate)
-                const float gCb = 1.0f - smooth01((dCb - loCb) * invSpanCb * shiftTight);
-                const float gCr = 1.0f - smooth01((dCr - loCr) * invSpanCr * shiftTight);
+                const float gCb = 1.0f - smooth01((dCb - loCb * gnC) * invSpanCb * invGnC * shiftTight);
+                const float gCr = 1.0f - smooth01((dCr - loCr * gnC) * invSpanCr * invGnC * shiftTight);
                 const float wY = tL * gY;
                 const float wCb = tC * gCb * gY;
                 const float wCr = tC * gCr * gY;

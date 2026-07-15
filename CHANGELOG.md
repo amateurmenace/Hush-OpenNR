@@ -1,5 +1,80 @@
 # OpenNR changelog
 
+## 3.4.0 — 2026-07-15
+
+The lock release: Lock Profile now freezes exactly the measurement you are
+looking at, an Auto Region button places the sampling box for you, the box
+finally shows whether it is live or frozen — and the temporal gate learns
+what the spatial stage always knew: shadows are noisier than highlights.
+
+### Fixed
+- **Lock Profile locks what you SEE.** Since v3.0 the lock measured the
+  playhead frame plus four frames spread across the whole clip (12/37/62/87%)
+  and stored the median — but the live (unlocked) render measures the
+  playhead frame. On anything but a locked-off shot the screen-fixed region
+  covers different content at those distant times, so the median collapsed
+  and locking visibly brought the noise back: place the box, watch the noise
+  vanish, hit Lock, watch it return. v3.4 locks the playhead measurement —
+  the locked result is identical to the live result at the moment you
+  clicked. (Second half of the "lock brings the noise back" bug; v3.2 fixed
+  the region-ignored half.)
+- **Auto Setup in region mode** had the same disease: sigmas now come from
+  the tracked playhead sweep (exactly what Lock stores), while the spread
+  frames keep doing what they are actually good for — classifying the
+  clip's motion, measured whole-frame.
+
+### Added
+- **Tracked lock sweep.** Lock doesn't stop at the playhead frame: it tracks
+  your patch across ±4 neighbouring frames (SAD over sampled luma with a
+  zero-motion prior, so featureless patches stay put instead of
+  random-walking; drift-capped), measures the region at its tracked
+  position, and lets a frame vote only when its measurement agrees with the
+  playhead's (sigma within 1.6×, patch brightness within 0.13). A subject
+  crossing the patch, an occlusion or a lost track simply drops out; worst
+  case the lock is exactly the playhead measurement. The Analysis line
+  reports it: "region at the playhead, 8 of 9 nearby frames agreed (patch
+  tracked, drift 2 px) · noise 3.2%Y / 4.1%C".
+- **Auto Region button.** One click scans the current frame for the flattest
+  patch at your region size (scored as local variance minus the expected
+  noise variance at that brightness, so dark noisy flats are not penalized),
+  switches the profile to From Region and moves the yellow box there so you
+  can see exactly what is being sampled — then you Lock, or run Auto Setup.
+  The v3.3 scan was report-only; the button is the consent to move the box
+  (Auto Setup still never touches it). One undo restores.
+- **The box shows its state.** Live = yellow, corner handles, centre cross,
+  draggable. Locked = dim ice blue with a padlock, handles gone, dragging
+  inert, region sliders greyed out — the profile is frozen and where the box
+  sits no longer matters. Unlock to move it. (Manual sigmas also grey out
+  while locked — a locked profile overrides them too; Auto Profile Adjust
+  stays live because it trims the locked values.)
+
+### Improved
+- **Brightness-aware temporal gate.** The estimator has always measured a
+  16-bin noise-vs-brightness curve, and the spatial stage has always used
+  it per pixel — but the temporal knee, Ghost Guard and the shift-search
+  engagement thresholds ran on one flat σ_T. On real footage shadows run
+  1.5–2.2× noisier than mids, so dark pixels' patch diffs read as motion
+  and the gate starved the shadows of averaging exactly where noise is
+  ugliest — while highlights got a knee that was too wide. v3.4 scales all
+  of them by the centre pixel's gain: measured +1.35 dB in the shadows on a
+  brightness-profiled scene (temporal-only, locked-sigma A/B isolating the
+  mechanism), highlights unchanged, +1.0 dB on the same scene in motion.
+  The 6σ firefly zapper deliberately stays unscaled (at that magnitude the
+  0.6–2.2× curve cannot flip a genuine impulse). Manual profiles have flat
+  curves — bit-exact with v3.3 there; all pinned goldens held without
+  re-pinning. Ported to all four implementations (CPU, Metal, CUDA, OpenCL)
+  with GPU parity green, including a sloped locked-gain-curve case.
+
+### Notes
+- The clean-class Auto-vs-defaults e2e margin widened 0.3 → 0.4 dB: with
+  the gate now consuming gains, Auto's locked clip-averaged curve vs the
+  defaults' live per-frame curve differ by estimation noise on clean
+  footage — ~0.3 dB at a fully transparent >59 dB. Not a visible change.
+- Lock data format (HUSHLOCK2) is unchanged; existing locked projects load
+  as before. Old projects' locks were clip-spread medians and may read
+  differently from what their region shows today — re-lock once to upgrade
+  them to playhead semantics.
+
 ## 3.3.0 — 2026-07-15
 
 More powerful and more efficient: the motion search quadruples its reach,

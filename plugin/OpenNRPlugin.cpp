@@ -33,23 +33,24 @@
 #define kPluginName "Hush Open NR"
 #define kPluginGrouping "Hush"
 #define kPluginDescription \
-    "Hush Open NR v3.3 — the free noise reduction suite.\n\n" \
+    "Hush Open NR v3.4 — the free noise reduction suite.\n\n" \
     "Click AUTO SETUP and the plugin measures your clip and dials in every " \
     "slider (one undo reverts) — or CLEAN SLATE to zero everything and work " \
     "fully manually. Work top to bottom: 1 measure, 2 temporal, 3 spatial, " \
     "4 refine, 5 inspect.\n\n" \
-    "New in 3.3: MOTION TRACKING reaches ~8 px (was 2) so real pans keep " \
-    "their temporal averaging, a 7 FRAMES stack for locked-off noisy shots, " \
-    "DEEP CLEAN — a gentle second pass for severe or compressed noise, " \
-    "per-channel chroma profiles (blue-channel night noise finally reads " \
-    "right), a big fps win when the profile is locked, and Auto Setup now " \
-    "suggests where a sampling region would go.\n\n" \
+    "New in 3.4: LOCK PROFILE now freezes exactly the measurement you are " \
+    "looking at (playhead frame, confirmed by a tracked sweep of its " \
+    "neighbours — no more noise coming back the moment you lock), AUTO " \
+    "REGION finds the flattest patch and moves the sampling box there for " \
+    "you, the box shows its state (yellow = live, blue padlock = frozen), " \
+    "and the temporal gate is brightness-aware — shadows keep their " \
+    "averaging, highlights gate tighter.\n\n" \
     "Each step has a Scope checkbox that draws a panel right in the viewer. " \
     "Turn scopes off before rendering.\n\n" \
     "MIT-licensed and free forever."
 #define kPluginIdentifier "org.opennr.Denoise"
 #define kPluginVersionMajor 3
-#define kPluginVersionMinor 3
+#define kPluginVersionMinor 4
 
 #define kSupportsTiles false
 #define kSupportsMultiResolution false
@@ -270,6 +271,8 @@ public:
         {
             if (p_ParamName == "autoSetup")
                 runAutoSetup(p_Args.time);
+            else if (p_ParamName == "autoRegion")
+                runAutoRegion(p_Args.time);
             else if (p_ParamName == "cleanSlate")
                 runCleanSlate();
             else if (p_ParamName == "lockProfile")
@@ -328,8 +331,14 @@ private:
     // never throws out of the action and never crashes.
     // p_Flat (optional): v3.3 B4 — the flattest-patch scan runs on the
     // first successfully fetched frame (the playhead frame)
+    // p_ForceWholeFrame: v3.4 — Auto Setup in region mode measures the
+    // spread frames whole-frame (they classify the CLIP: motion energy);
+    // a screen-fixed region means nothing at distant times — that was the
+    // "lock brings the noise back" bug. The region's own sigmas come from
+    // the tracked playhead sweep (analyzeLockSweepAt) instead.
     int analyzeClipFrames(double p_Time, std::vector<nrcore::Stats>& p_Out,
-                          nranalyze::FlatPatch* p_Flat = nullptr)
+                          nranalyze::FlatPatch* p_Flat = nullptr,
+                          bool p_ForceWholeFrame = false)
     {
         try
         {
@@ -359,7 +368,7 @@ private:
             nrcore::Params ap;
             int src = 0;
             m_ProfileSource->getValue(src);
-            if (src == 1)
+            if (src == 1 && !p_ForceWholeFrame)
             {
                 ap.profileSource = 1;
                 ap.regionCX   = static_cast<float>(m_RegionCX->getValue());
@@ -406,6 +415,105 @@ private:
         catch (...)
         {
             return static_cast<int>(p_Out.size());
+        }
+    }
+
+    // v3.4 — the tracked lock sweep at the playhead (see nr_analyze.h for
+    // the semantics). This is a streaming port of nranalyze::lockSweepAnalyze
+    // feeding the same helpers — at most 3 frames resident (anchor + a
+    // sliding prev/cur pair) instead of 9, because instanceChanged can run
+    // on a UHD timeline where nine packed float frames are >1 GB.
+    bool analyzeLockSweepAt(double p_Time, nranalyze::LockSweep& p_Out)
+    {
+        try
+        {
+            if (!m_SrcClip || !m_SrcClip->isConnected())
+                return false;
+            const OfxRangeD range = m_SrcClip->getFrameRange();
+
+            nrcore::Params ap;
+            int src = 0;
+            m_ProfileSource->getValue(src);
+            const bool region = (src == 1);
+            if (region)
+            {
+                ap.profileSource = 1;
+                ap.regionCX   = static_cast<float>(m_RegionCX->getValue());
+                ap.regionCY   = static_cast<float>(m_RegionCY->getValue());
+                ap.regionSize = static_cast<float>(m_RegionSize->getValue());
+            }
+
+            int W = 0, H = 0;
+            auto fetchPacked = [&](double t, std::vector<float>& buf) -> bool {
+                std::unique_ptr<OFX::Image> img(m_SrcClip->fetchImage(t));
+                if (!img || img->getPixelDepth() != OFX::eBitDepthFloat ||
+                    img->getPixelComponents() != OFX::ePixelComponentRGBA)
+                    return false;
+                int w = 0, h = 0;
+                packImage(img.get(), w, h, buf);
+                if (w < 16 || h < 16)
+                    return false;
+                if (W == 0) { W = w; H = h; }
+                return (w == W && h == H);
+            };
+
+            std::vector<float> anchorBuf;
+            if (!fetchPacked(p_Time, anchorBuf))
+                return false;
+
+            nranalyze::SweepSample anchor;
+            bool anchorMeasured = false;
+            std::vector<nranalyze::SweepSample> others;
+
+            for (int dir = +1; dir >= -1; dir -= 2)
+            {
+                std::vector<float> prev;
+                const float* prevPtr = anchorBuf.data();
+                nranalyze::RegionTrack tr;
+                for (int k = 1; k <= 4; ++k)
+                {
+                    const double t = p_Time + dir * k;
+                    if (t > range.max || t < range.min)
+                        break;
+                    std::vector<float> cur;
+                    if (!fetchPacked(t, cur))
+                        break;
+                    // the first fetched neighbour doubles as the anchor's
+                    // temporal-diff partner (matches the reference: next
+                    // frame when the forward pass produced one, else prev)
+                    if (!anchorMeasured)
+                    {
+                        nranalyze::measureAtOffset(anchorBuf.data(), cur.data(), W, H,
+                                                   ap, 0, 0, anchor);
+                        anchorMeasured = true;
+                    }
+                    if (region)
+                    {
+                        tr = nranalyze::trackRegionStep(prevPtr, cur.data(), W, H,
+                                                        ap.regionCX, ap.regionCY,
+                                                        ap.regionSize, tr);
+                        if (!tr.ok)
+                            break;
+                    }
+                    nranalyze::SweepSample s;
+                    nranalyze::measureAtOffset(cur.data(), prevPtr, W, H,
+                                               ap, tr.dx, tr.dy, s);
+                    others.push_back(s);
+                    prev = std::move(cur);
+                    prevPtr = prev.data();
+                }
+            }
+            if (!anchorMeasured)   // single-frame clip: no partner anywhere
+                nranalyze::measureAtOffset(anchorBuf.data(), nullptr, W, H,
+                                           ap, 0, 0, anchor);
+
+            p_Out = nranalyze::composeLockAggregate(anchor, others,
+                        (region && !others.empty()) ? 1 : 0);
+            return p_Out.measured > 0;
+        }
+        catch (...)
+        {
+            return false;
         }
     }
 
@@ -460,14 +568,34 @@ private:
 
     void runAutoSetup(double p_Time)
     {
+        int srcNow0 = 0;
+        m_ProfileSource->getValue(srcNow0);
+        const bool fromRegion = (srcNow0 == 1);
+
+        // spread frames classify the CLIP (motion energy; the noise class in
+        // whole-frame mode) — in region mode they are measured whole-frame,
+        // and the noise itself comes from the tracked playhead sweep below,
+        // exactly what Lock Profile would store (v3.4)
         std::vector<nrcore::Stats> per;
         nranalyze::FlatPatch flat;
-        if (analyzeClipFrames(p_Time, per, &flat) <= 0)
+        if (analyzeClipFrames(p_Time, per, &flat, fromRegion) <= 0)
         {
             analysisFailedMessage();
             return;
         }
-        const nranalyze::ClipAggregate agg = nranalyze::aggregateClipStats(per);
+        nranalyze::ClipAggregate agg = nranalyze::aggregateClipStats(per);
+        if (fromRegion)
+        {
+            nranalyze::LockSweep sw;
+            if (!analyzeLockSweepAt(p_Time, sw) || sw.measured <= 0)
+            {
+                analysisFailedMessage();
+                return;
+            }
+            const float clipMotion = agg.motion;   // a property of the clip,
+            agg = sw.agg;                          // not of the user's patch
+            agg.motion = clipMotion;
+        }
         const nranalyze::AutoSettings as = nranalyze::mapAnalysisToSettings(agg);
 
         // belt and braces: the whole apply is one edit block (single Cmd+Z),
@@ -545,14 +673,98 @@ private:
         updateEnabledness();
     }
 
+    // v3.4 — Auto Region: find the flattest patch on the playhead frame,
+    // switch the profile to From Region and move the yellow box there. The
+    // button IS the consent to move the rectangle (Auto Setup still never
+    // touches it). Does not lock — the user watches the live measurement at
+    // the new spot, then locks (or runs Auto Setup). One undo restores.
+    void runAutoRegion(double p_Time)
+    {
+        try
+        {
+            if (!m_SrcClip || !m_SrcClip->isConnected())
+            {
+                analysisFailedMessage();
+                return;
+            }
+            std::unique_ptr<OFX::Image> img(m_SrcClip->fetchImage(p_Time));
+            if (!img || img->getPixelDepth() != OFX::eBitDepthFloat ||
+                img->getPixelComponents() != OFX::ePixelComponentRGBA)
+            {
+                analysisFailedMessage();
+                return;
+            }
+            int W = 0, H = 0;
+            std::vector<float> buf;
+            packImage(img.get(), W, H, buf);
+            if (W < 64 || H < 64)
+            {
+                analysisFailedMessage();
+                return;
+            }
+
+            // whole-frame estimate first: the scan scores candidates against
+            // the expected noise at their brightness (gain curve)
+            nrcore::Params ap;
+            nrcore::Stats st;
+            nrcore::estimateInput(buf.data(), nullptr, W, H, ap, st);
+            const float rs = static_cast<float>(m_RegionSize->getValue());
+            const nranalyze::FlatPatch fp =
+                nranalyze::findFlattestPatch(buf.data(), W, H, st, rs);
+            if (!fp.valid)
+            {
+                analysisFailedMessage();
+                return;
+            }
+
+            // what the region will read at the new spot (for the status line)
+            nrcore::Params rp;
+            rp.profileSource = 1;
+            rp.regionCX = fp.cx;
+            rp.regionCY = fp.cy;
+            rp.regionSize = rs;
+            nrcore::Stats rst;
+            nrcore::estimateInput(buf.data(), nullptr, W, H, rp, rst);
+
+            m_InAutoApply = true;
+            beginEditBlock("Hush Auto Region");
+            m_ProfileSource->setValue(1);
+            m_RegionCX->setValue(fp.cx);
+            m_RegionCY->setValue(fp.cy);
+            m_LockProfile->setValue(false);   // a new spot measures live again
+            m_AutoReport->setValue(nranalyze::formatRegionReport(fp, rst));
+            endEditBlock();
+            m_InAutoApply = false;
+            updateEnabledness();
+        }
+        catch (...)
+        {
+            m_InAutoApply = false;
+            analysisFailedMessage();
+        }
+    }
+
     void lockProfileToggled(double p_Time)
     {
         bool on = false;
         m_LockProfile->getValue(on);
         if (!on)
-            return;   // unlock: back to live measurement, keep the stored data
-        std::vector<nrcore::Stats> per;
-        if (analyzeClipFrames(p_Time, per) <= 0)
+        {
+            // unlock: back to live per-frame measurement (stored data kept —
+            // re-ticking without re-analysis restores it via the project)
+            m_AutoReport->setValue("Profile unlocked \xe2\x80\x94 measuring live again, "
+                                   "every frame.");
+            return;
+        }
+        // v3.4: freeze what the user is LOOKING AT — the playhead measurement,
+        // hardened by the tracked +/-4-frame sweep (see nr_analyze.h). The
+        // pre-3.4 clip-spread median could lock junk on moving footage: the
+        // live render measured the playhead, the lock measured four distant
+        // frames, and the NR visibly collapsed the moment you locked.
+        int src = 0;
+        m_ProfileSource->getValue(src);
+        nranalyze::LockSweep sw;
+        if (!analyzeLockSweepAt(p_Time, sw) || sw.measured <= 0)
         {
             m_InAutoApply = true;
             m_LockProfile->setValue(false);
@@ -560,10 +772,10 @@ private:
             analysisFailedMessage();
             return;
         }
-        const nranalyze::ClipAggregate agg = nranalyze::aggregateClipStats(per);
-        m_LockData->setValue(nranalyze::formatLockedProfile(agg));
-        m_LockAgg = agg;
+        m_LockData->setValue(nranalyze::formatLockedProfile(sw.agg));
+        m_LockAgg = sw.agg;
         m_LockValid = true;
+        m_AutoReport->setValue(nranalyze::formatLockReport(sw, src == 1 ? 1 : 0));
     }
 
     // reach: frames needed after t for temporal NR; prevReach: frames needed
@@ -588,14 +800,20 @@ private:
     {
         int source = 0;
         m_ProfileSource->getValue(source);
+        bool locked = false;
+        m_LockProfile->getValue(locked);
         const bool autoOn = (source != 2);
         const bool regionOn = (source == 1);
-        m_SigmaY->setEnabled(!autoOn);
-        m_SigmaC->setEnabled(!autoOn);
-        m_ProfileAdjust->setEnabled(autoOn);
-        m_RegionCX->setEnabled(regionOn);
-        m_RegionCY->setEnabled(regionOn);
-        m_RegionSize->setEnabled(regionOn);
+        // v3.4: a locked profile overrides everything (even Manual), so the
+        // inputs it ignores grey out — the region stops sampling (the box
+        // dims and its dragging goes inert too), the manual sigmas stop
+        // mattering, and only Auto Profile Adjust keeps trimming the lock.
+        m_SigmaY->setEnabled(!autoOn && !locked);
+        m_SigmaC->setEnabled(!autoOn && !locked);
+        m_ProfileAdjust->setEnabled(autoOn || locked);
+        m_RegionCX->setEnabled(regionOn && !locked);
+        m_RegionCY->setEnabled(regionOn && !locked);
+        m_RegionSize->setEnabled(regionOn && !locked);
 
         const bool tOn = m_EnableTemporal->getValue();
         m_TemporalFrames->setEnabled(tOn);
@@ -943,10 +1161,12 @@ public:
         m_CX     = p_Effect->fetchDoubleParam("regionCenterX");
         m_CY     = p_Effect->fetchDoubleParam("regionCenterY");
         m_Size   = p_Effect->fetchDoubleParam("regionSize");
+        m_Lock   = p_Effect->fetchBooleanParam("lockProfile");
         addParamToSlaveTo(m_Source);
         addParamToSlaveTo(m_CX);
         addParamToSlaveTo(m_CY);
         addParamToSlaveTo(m_Size);
+        addParamToSlaveTo(m_Lock);
     }
 
     virtual bool draw(const OFX::DrawArgs& p_Args)
@@ -958,9 +1178,15 @@ public:
         double cx, cy, half;
         geometry(cx, cy, half);
         const double hs = 5.0 * std::max(p_Args.pixelScale.x, 1e-6);
+        const bool locked = lockedNow();
 
+        // v3.4: the box tells you its mode. LIVE = yellow, handles, centre
+        // cross — it re-measures every frame, drag it around. LOCKED = dim
+        // ice blue, no handles, a padlock — it stopped sampling entirely
+        // (the profile is frozen; where the box sits no longer matters).
         const OfxRGBAColourF yellow = { 1.0f, 0.9f, 0.1f, 1.0f };
-        ds->setColour(p_Args.context, &yellow);
+        const OfxRGBAColourF ice    = { 0.45f, 0.72f, 0.95f, 0.75f };
+        ds->setColour(p_Args.context, locked ? &ice : &yellow);
         ds->setLineWidth(p_Args.context, 2.0f);
         ds->setLineStipple(p_Args.context, kOfxDrawLineStipplePatternSolid);
 
@@ -968,24 +1194,39 @@ public:
                                     { cx + half, cy + half }, { cx - half, cy + half } };
         ds->draw(p_Args.context, kOfxDrawPrimitiveLineLoop, rect, 4);
 
-        // corner handles (filled)
-        for (int i = 0; i < 4; ++i) {
-            const OfxPointD h[2] = { { rect[i].x - hs, rect[i].y - hs },
-                                     { rect[i].x + hs, rect[i].y + hs } };
-            ds->draw(p_Args.context, kOfxDrawPrimitiveRectangle, h, 2);
-        }
+        if (!locked) {
+            // corner handles (filled)
+            for (int i = 0; i < 4; ++i) {
+                const OfxPointD h[2] = { { rect[i].x - hs, rect[i].y - hs },
+                                         { rect[i].x + hs, rect[i].y + hs } };
+                ds->draw(p_Args.context, kOfxDrawPrimitiveRectangle, h, 2);
+            }
 
-        // center cross
-        const OfxPointD crossH[2] = { { cx - hs * 1.5, cy }, { cx + hs * 1.5, cy } };
-        const OfxPointD crossV[2] = { { cx, cy - hs * 1.5 }, { cx, cy + hs * 1.5 } };
-        ds->draw(p_Args.context, kOfxDrawPrimitiveLines, crossH, 2);
-        ds->draw(p_Args.context, kOfxDrawPrimitiveLines, crossV, 2);
+            // center cross
+            const OfxPointD crossH[2] = { { cx - hs * 1.5, cy }, { cx + hs * 1.5, cy } };
+            const OfxPointD crossV[2] = { { cx, cy - hs * 1.5 }, { cx, cy + hs * 1.5 } };
+            ds->draw(p_Args.context, kOfxDrawPrimitiveLines, crossH, 2);
+            ds->draw(p_Args.context, kOfxDrawPrimitiveLines, crossV, 2);
+        } else {
+            // padlock just inside the top-left corner: filled body + shackle
+            const double u  = std::max(p_Args.pixelScale.x, 1e-6) * 3.0;
+            const double ax = cx - half + 2.5 * u;          // body left
+            const double ay = cy + half - 6.5 * u;          // body base
+            const OfxPointD body[2] = { { ax, ay }, { ax + 4.0 * u, ay + 3.0 * u } };
+            ds->draw(p_Args.context, kOfxDrawPrimitiveRectangle, body, 2);
+            const OfxPointD shackle[6] = {
+                { ax + 1.0 * u, ay + 3.0 * u }, { ax + 1.0 * u, ay + 4.5 * u },
+                { ax + 1.0 * u, ay + 4.5 * u }, { ax + 3.0 * u, ay + 4.5 * u },
+                { ax + 3.0 * u, ay + 4.5 * u }, { ax + 3.0 * u, ay + 3.0 * u }
+            };
+            ds->draw(p_Args.context, kOfxDrawPrimitiveLines, shackle, 6);
+        }
         return true;
     }
 
     virtual bool penDown(const OFX::PenArgs& p_Args)
     {
-        if (!regionActive())
+        if (!regionActive() || lockedNow())
             return false;
         double cx, cy, half;
         geometry(cx, cy, half);
@@ -1012,7 +1253,7 @@ public:
 
     virtual bool penMotion(const OFX::PenArgs& p_Args)
     {
-        if (m_Drag == 0 || !regionActive())
+        if (m_Drag == 0 || !regionActive() || lockedNow())
             return false;
         const OfxPointD ext = _effect->getProjectExtent();
         const double minDim = std::min(ext.x, ext.y);
@@ -1046,6 +1287,13 @@ private:
         return s == 1;
     }
 
+    bool lockedNow()
+    {
+        bool on = false;
+        m_Lock->getValue(on);
+        return on;
+    }
+
     // canonical-coordinate geometry (OFX images are bottom-up, so the kernel's
     // normalized y maps directly onto the interact's y-up canonical space)
     void geometry(double& cx, double& cy, double& half)
@@ -1056,10 +1304,11 @@ private:
         half = 0.5 * m_Size->getValue() * std::min(ext.x, ext.y);
     }
 
-    OFX::ChoiceParam* m_Source;
-    OFX::DoubleParam* m_CX;
-    OFX::DoubleParam* m_CY;
-    OFX::DoubleParam* m_Size;
+    OFX::ChoiceParam*  m_Source;
+    OFX::DoubleParam*  m_CX;
+    OFX::DoubleParam*  m_CY;
+    OFX::DoubleParam*  m_Size;
+    OFX::BooleanParam* m_Lock;
     int m_Drag;
     double m_GrabX = 0.0, m_GrabY = 0.0;
 };
@@ -1174,9 +1423,18 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
         page->addChild(*b);
     }
     {
+        OFX::PushButtonParamDescriptor* b = p_Desc.definePushButtonParam("autoRegion");
+        b->setLabels("Auto Region (Find Flat Patch)", "Auto Region (Find Flat Patch)", "Auto Region");
+        b->setHint("Scans the current frame for the flattest area — where noise measures most "
+                   "accurately — switches the profile to From Region and moves the yellow box "
+                   "there so you can see exactly what is sampled. Watch it live, then Lock "
+                   "Profile to freeze it (or run Auto Setup). One undo restores.");
+        page->addChild(*b);
+    }
+    {
         OFX::StringParamDescriptor* s = p_Desc.defineStringParam("autoReport");
         s->setLabels("Analysis", "Analysis", "Analysis");
-        s->setHint("What the last Auto Setup measured and decided.");
+        s->setHint("What the last analysis (Auto Setup, Auto Region or Lock) measured and decided.");
         s->setDefault("Click Auto Setup to analyze this clip.");
         s->setEnabled(false);
         s->setEvaluateOnChange(false);
@@ -1209,8 +1467,9 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     {
         OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("profileSource");
         c->setLabels("Noise Profile", "Noise Profile", "Profile");
-        c->setHint("Where the noise level comes from: measured on the whole frame, measured "
-                   "only inside the draggable yellow rectangle (put it on a flat area), or "
+        c->setHint("Where the noise level comes from: measured LIVE every frame on the whole "
+                   "frame, measured live inside the draggable yellow rectangle (put it on a "
+                   "flat area — Auto Region finds one — then Lock Profile to freeze it), or "
                    "typed in manually.");
         c->appendOption("Automatic (Whole Frame)");
         c->appendOption("Automatic (From Region)");
@@ -1221,7 +1480,8 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     }
     defineDouble(p_Desc, page, "regionCenterX", "Region Center X",
                  "Horizontal center of the measurement region (0 = left, 1 = right). "
-                 "Easier: drag the yellow rectangle in the viewer.", 0.5, 0.0, 1.0, grpProfile);
+                 "Easier: drag the yellow rectangle in the viewer, or click Auto Region. "
+                 "The box samples live every frame until you Lock Profile.", 0.5, 0.0, 1.0, grpProfile);
     defineDouble(p_Desc, page, "regionCenterY", "Region Center Y",
                  "Vertical center of the measurement region (0 = bottom, 1 = top).", 0.5, 0.0, 1.0, grpProfile);
     defineDouble(p_Desc, page, "regionSize", "Region Size",
@@ -1236,11 +1496,12 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
     defineDouble(p_Desc, page, "sigmaChroma", "Manual Chroma Noise (%)",
                  "Color-noise level in percent (Manual profile only).", 2.0, 0.05, 40.0, grpProfile);
     defineBool(p_Desc, page, "lockProfile", "Lock Profile",
-               "Freezes the measurement you have RIGHT NOW — including a From Region setup — "
-               "averaged across the clip, so the profile stops changing as the scene moves. "
-               "Dial in on a good still, then lock. Auto Profile Adjust still trims a locked "
-               "profile; un-tick to go back to live per-frame measurement. Saved with the "
-               "project.",
+               "Freezes the measurement you are looking at RIGHT NOW — the playhead frame, "
+               "confirmed against a few tracked neighbouring frames — so the profile stops "
+               "changing as footage moves under the box (which turns blue and stops sampling). "
+               "Park on a frame where it looks right, then lock. Auto Profile Adjust still "
+               "trims a locked profile; un-tick for live per-frame measurement. Saved with "
+               "the project.",
                false, grpProfile);
     defineBool(p_Desc, page, "scopeMeasure", "Scope: Measurements",
                "Draws the measurement panel in the viewer: noise levels in and after Step 2, "

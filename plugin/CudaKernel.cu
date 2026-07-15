@@ -558,6 +558,22 @@ __global__ void TemporalKernel(NRParams p, int W, int H,
         }
     }
 
+    // v3.4: per-brightness gate calibration — every temporal threshold scales
+    // with the centre pixel's gain-curve gain, exactly like the spatial stage
+    // always did (see nr_core.h for the shadows/highlights rationale; the
+    // 6-sigma zapper stays unscaled on purpose). Gains follow the same
+    // locked/manual/live triple as the spatial pass: the lock fast path skips
+    // FinalizeStats, so a locked profile's gains must come from the params.
+    const bool manualG = (p.profileSource == 2) && (p.profileLocked == 0);
+    const bool lockedG = (p.profileLocked != 0);
+    const int gLb = clampi((int)(cy9[4] * kLumaBins), 0, kLumaBins - 1);
+    const float gnY = lockedG ? clampf(p.lockGainY[gLb], 0.6f, 2.2f)
+                    : manualG ? 1.0f : __uint_as_float(stats[S_GY + gLb]);
+    const float gnC = lockedG ? clampf(p.lockGainC[gLb], 0.6f, 2.2f)
+                    : manualG ? 1.0f : __uint_as_float(stats[S_GC + gLb]);
+    const float invGnY = 1.0f / gnY;
+    const float invGnC = 1.0f / gnC;
+
     float accY = cy9[4], accCb = ccb9[4], accCr = ccr9[4];
     float sumWY = 1.0f, sumWY2 = 1.0f, sumWCb = 1.0f, sumWCr = 1.0f;
 
@@ -577,13 +593,13 @@ __global__ void TemporalKernel(NRParams p, int W, int H,
         // v3.3 B1 hierarchical shift search — see nr_core.h for the grid,
         // the margins and the drift-bias rationale
         float shiftTight = 1.0f;
-        if (track && dY > searchThresh) {
+        if (track && dY > searchThresh * gnY) {
             int wx = 0, wy = 0;
             // coarse level only when the unshifted match is FULLY outside
             // the knee (weight already zero — nothing to lose by hunting
             // far); static/drift noise crosses searchThresh routinely but
             // hiY rarely, so it never pays the 16-node sweep. See nr_core.h.
-            if (dY > hiY) {
+            if (dY > hiY * gnY) {
                 if (!haveCb9) {
                     int i2 = 0;
                     for (int dy = -1; dy <= 1; ++dy)
@@ -632,12 +648,12 @@ __global__ void TemporalKernel(NRParams p, int W, int H,
             }
         }
 
-        float gY = 1.0f - smooth01f((dY - loY) * invSpanY * shiftTight);
+        float gY = 1.0f - smooth01f((dY - loY * gnY) * invSpanY * invGnY * shiftTight);
         if (guard)
-            gY *= 1.0f - smooth01f((fabsf(sdY) - loS) * invSpanS * shiftTight);
+            gY *= 1.0f - smooth01f((fabsf(sdY) - loS * gnY) * invSpanS * invGnY * shiftTight);
         // v3.3 B5: per-channel chroma gates (both slaved to the luma gate)
-        const float gCb = 1.0f - smooth01f((dCb - loCb) * invSpanCb * shiftTight);
-        const float gCr = 1.0f - smooth01f((dCr - loCr) * invSpanCr * shiftTight);
+        const float gCb = 1.0f - smooth01f((dCb - loCb * gnC) * invSpanCb * invGnC * shiftTight);
+        const float gCr = 1.0f - smooth01f((dCr - loCr * gnC) * invSpanCr * invGnC * shiftTight);
         const float wY = tL * gY;
         const float wCb = tC * gCb * gY;
         const float wCr = tC * gCr * gY;

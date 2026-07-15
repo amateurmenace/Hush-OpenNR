@@ -38,14 +38,26 @@ edges, fine checker texture and 2-px lines survive.*
   frame: frame-to-frame differences (immune to the spatially-correlated noise
   that compression and debayering create), plus fine- and coarse-scale spatial
   estimators. Robust medians/quantiles keep motion, edges and texture out of
-  the measurement. **v3 adds Lock Profile**: freeze the measured profile
-  (aggregated across the clip) so every frame filters against the same
-  numbers — the HUD shows LOCKED, and it survives save/reload.
-- **Motion-tracked temporal NR (v3)** — before gating each neighbour frame the
-  temporal stage tries shifting its patch up to ±2 px and matches on the best
-  alignment, so slow pans and handheld drift keep their across-frames
-  averaging. The hard-knee gate is unchanged — still exactly zero past the
-  knee, still ghost-proof — and shifted matches face a steeper gate.
+  the measurement. **Lock Profile (fixed in v3.4)** freezes exactly the
+  measurement you are looking at — the playhead frame, confirmed by a tracked
+  sweep of its neighbours — so every frame filters against the numbers you
+  approved. The box turns blue with a padlock while locked, the HUD shows
+  LOCKED, and it survives save/reload.
+- **Auto Region (v3.4)** — one click finds the flattest patch on the current
+  frame (scored against the expected noise at its brightness, so dark noisy
+  flats aren't penalized), moves the sampling box there and shows it. Watch
+  the live measurement, then lock it.
+- **Brightness-aware temporal gate (v3.4)** — the measured noise-vs-brightness
+  curve now calibrates the temporal knee, Ghost Guard and the motion-search
+  thresholds per pixel, like the spatial stage always did: shadows (noisier)
+  keep their averaging instead of reading as motion, highlights gate tighter.
+  Measured +1.35 dB in the shadows on a brightness-profiled scene.
+- **Motion-tracked temporal NR (v3, ~±8 px since v3.3)** — before gating each
+  neighbour frame the temporal stage re-aims its patch with a hierarchical
+  search (step-4 coarse grid on block means, then a converging ±1 refine
+  walk), so real pans and handheld drift keep their across-frames averaging.
+  The hard-knee gate is unchanged — still exactly zero past the knee, still
+  ghost-proof — and shifted matches face a steeper gate.
 - **Firefly removal (v3)** — single-frame impulses (hot pixels, sensor
   fireflies) are clipped to the 3-frame temporal median. Three independent
   tests must agree before a pixel is touched, so thin fast-moving detail
@@ -83,23 +95,26 @@ edges, fine checker texture and 2-px lines survive.*
 - **Spatial NR** — noise-adaptive non-local means (or faster bilateral),
   separate **luma / chroma strengths**, edge-aware **Preserve Detail**.
 - **Profile from a region** — restrict measurement to a rectangle you place on
-  a flat area (positioned live in the Noise Analysis view), or go full manual.
+  a flat area (or let **Auto Region** place it). The box is a live probe:
+  yellow and draggable while measuring per frame, dim blue with a padlock
+  once locked. Or go full manual.
 - Works in **DaVinci Resolve free and Studio** (17+), macOS binaries are
   universal (Apple Silicon + Intel, macOS 11+).
 
 ## Performance
 
-Measured on an Apple M1 Max (`test/bench_metal.mm`), v3.3. The bench feeds
+Measured on an Apple M1 Max (`test/bench_metal.mm`), v3.4. The bench feeds
 realistic frames (scene + per-frame noise). Panning costs more than v3.2
-because the motion search now genuinely re-aims up to ~8 px — including the
+because the motion search genuinely re-aims up to ~8 px — including the
 ±2-frame neighbours v3.2 simply gated off; toggle Motion Tracking off for
-the old speed. Lock Profile is now also the fast path: with no scopes open,
-a locked profile skips the whole input measurement.
+the old speed. Lock Profile is also the fast path: with no scopes open, a
+locked profile skips the whole input measurement. The v3.4 brightness-aware
+gate costs ~3–4% (two per-pixel gain lookups in the merge).
 
 | Resolution | Better (NLM, R3, 5 frames) | Locked profile | Panning footage | 7 Frames | Faster (bilateral, R2, 3 frames) |
 |---|---|---|---|---|---|
-| HD 1920×1080 | 9.2 ms (109 fps) | 7.5 ms (133 fps) | 19.4 ms (52 fps) | 9.9 ms (101 fps) | 5.4 ms (184 fps) |
-| UHD 3840×2160 | 35.4 ms (28 fps) | 30.1 ms (33 fps) | 75.4 ms (13 fps) | 38.0 ms (26 fps) | 20.3 ms (49 fps) |
+| HD 1920×1080 | 9.7 ms (104 fps) | 7.8 ms (129 fps) | 19.8 ms (51 fps) | 10.6 ms (95 fps) | 5.7 ms (176 fps) |
+| UHD 3840×2160 | 36.7 ms (27 fps) | 30.8 ms (32 fps) | 76.7 ms (13 fps) | 40.0 ms (25 fps) | 21.1 ms (48 fps) |
 
 Real-time UHD at maximum quality on Apple Silicon; Deep Clean adds ~3 ms at
 HD when enabled.
@@ -166,18 +181,19 @@ Temporal Activity view) to understand what each is contributing.
 | Step | Control | What it does |
 |---|---|---|
 | — | **Strength** | Overall amount; scales every strength at once. 0 = off, 1 = normal, up to 3 the filters widen what they treat as noise. |
-| — | **Auto Setup (Analyze Footage)** | Analyzes the clip (honoring your region, if set) and writes the best settings into the sliders below, then locks the profile. Everything stays manually adjustable; one undo reverts. |
-| — | Analysis | Read-only report of what the last Auto Setup measured and decided. |
+| — | **Auto Setup (Analyze Footage)** | Analyzes the clip (region-aware: sigmas come from your tracked region at the playhead, motion from frames across the clip) and writes the best settings into the sliders below, then locks the profile. Everything stays manually adjustable; one undo reverts. |
+| — | **Auto Region (Find Flat Patch)** | Scans the current frame for the flattest area, switches the profile to From Region and moves the yellow box there. Watch it live, then Lock Profile (or run Auto Setup). One undo restores. |
+| — | Analysis | Read-only report of what the last Auto Setup / Auto Region / Lock measured and decided. |
 | — | **Clean Slate (All Off)** | Zeroes every processing control — true passthrough, build up manually from nothing. One undo restores. |
 | 1 | **Noise Profile** | Automatic (whole frame) / Automatic (from region) / Manual. Unlocked, the measurement is live per frame; **Lock Profile** is the "stop changing" switch. |
-| 1 | Region Center X/Y, Size | The measurement rectangle (drag it in the viewer). Put it on a flat area. |
+| 1 | Region Center X/Y, Size | The measurement rectangle (drag it in the viewer, or click Auto Region). Put it on a flat area. Yellow = sampling live every frame; blue + padlock = frozen. |
 | 1 | **Auto Profile Adjust** | Scales the measurement (×0.25–×6) — live **and locked** profiles alike. |
 | 1 | Manual Luma / Chroma Noise (%) | Direct noise levels, used only in Manual mode. Clean ≈ 0.5–1, noisy ≈ 2–5, low-light ≈ 5–10. |
-| 1 | **Lock Profile** | Freezes the measurement you have right now — region included — averaged across the clip. Dial in on a good still, then lock. Saved with the project. |
+| 1 | **Lock Profile** | Freezes the measurement at the playhead — exactly what you are looking at, confirmed across a few tracked neighbouring frames (a subject crossing the patch is rejected). Park on a frame where it looks right, then lock. Saved with the project. |
 | 1 | **Scope: Measurements** | The measurement panel, drawn live in the viewer. |
 | 2 | **Enable Temporal NR** | Toggle the across-frames stage. |
-| 2 | Number of Frames | 3 or 5 frames averaged. |
-| 2 | **Motion Tracking** | Shift-search patch matching (±2 px) so slow pans keep their temporal averaging. |
+| 2 | Number of Frames | 3, 5 or 7 frames averaged. |
+| 2 | **Motion Tracking** | Hierarchical shift-search patch matching (~±8 px) so real pans keep their temporal averaging. |
 | 2 | Luma / Chroma Strength | Temporal blending (0–125; above 100 matching neighbours outweigh the current frame). |
 | 2 | Motion Threshold | How much change counts as motion (0–150). Seeing smear on movement? Lower this first. |
 | 2 | **Ghost Guard** | Second motion test on the *signed* patch mean — catches the slow, subtle motion (slow-mo smear) the magnitude gate can't see. Nearly free; leave on. |
@@ -276,9 +292,11 @@ c++ -O2 -std=c++14 -I../plugin test_metal.mm ../plugin/MetalKernel.mm \
    and a spatial-estimate clamp), median |Laplacian| at fine scale, and at
    coarse scale (catches blotchy correlated noise). The temporal stage is
    gated by the temporal estimate; the spatial stage by the spatial one.
-2. **Temporal** — each pixel is compared patch-wise (3×3) against ±1/±2
+2. **Temporal** — each pixel is compared patch-wise (3×3) against up to ±3
    frames; differences are bias-corrected by the expected noise difference
-   and gated softly in units of σ. The achieved effective sample count is
+   and gated softly in units of σ — since v3.4 the *local* σ, scaled by the
+   measured noise-vs-brightness curve, so shadows gate as generously as
+   their real noise deserves. The achieved effective sample count is
    carried forward per pixel (and visualized in Temporal Activity).
 3. **Spatial** — non-local means on the temporal result, filter strength tied
    to the *remaining* noise (σ/√effN), patch distances bias-corrected by 2σ²,

@@ -177,26 +177,32 @@ inline bool parseLockedProfile(const std::string& s, ClipAggregate& out)
 // v3.3 B4 — flattest-patch scan: where a sampling region SHOULD go
 // ---------------------------------------------------------------------------
 // The From Region profile is only as good as the rectangle the user drew —
-// on a flat area it is exact, on texture it overreads. Auto Setup scans a
-// coarse grid of candidate patches and scores each by structure content:
-// mean 3x3 local luma variance minus the expected noise variance at that
-// brightness (so dark noisy flats are not penalized for their noise). The
-// lowest-scoring centre is REPORTED in the Analysis line — never applied;
-// the user's rectangle is never moved.
+// on a flat area it is exact, on texture it overreads. The scan walks a
+// grid of candidate patches and scores each by structure content: mean 3x3
+// local luma variance minus the expected noise variance at that brightness
+// (so dark noisy flats are not penalized for their noise). Auto Setup only
+// REPORTS the lowest-scoring centre in the Analysis line (it never moves the
+// user's rectangle); the v3.4 Auto Region button applies it deliberately —
+// pressing that button IS the consent to move the box.
+// v3.4: the patch size follows the caller's region size (the box lands where
+// a box THAT size is flattest) and the grid tightened 7 -> 9.
 struct FlatPatch {
     float cx = 0.5f, cy = 0.5f;   // normalized centre of the flattest patch
     int   valid = 0;
 };
 
 inline FlatPatch findFlattestPatch(const float* rgba, int W, int H,
-                                   const nrcore::Stats& st)
+                                   const nrcore::Stats& st,
+                                   float regionSize = 0.25f)
 {
     FlatPatch fp;
     if (W < 64 || H < 64)
         return fp;
-    // patch half-size matches the region default (regionSize 0.25)
-    const int half = std::max(8, static_cast<int>(0.125f * static_cast<float>(std::min(W, H))));
-    const int grid = 7;
+    // patch half-size mirrors estimateInput's region half (0.5 * size * minDim),
+    // capped so a large region still scans meaningfully inside the frame
+    const float rs = std::min(0.5f, std::max(0.05f, regionSize));
+    const int half = std::max(8, static_cast<int>(0.5f * rs * static_cast<float>(std::min(W, H))));
+    const int grid = 9;
     float bestScore = 0.0f;
     for (int gy = 0; gy < grid; ++gy) {
         for (int gx = 0; gx < grid; ++gx) {
@@ -242,6 +248,276 @@ inline FlatPatch findFlattestPatch(const float* rgba, int W, int H,
         }
     }
     return fp;
+}
+
+// ---------------------------------------------------------------------------
+// v3.4 — lock sweep: freeze what the user SEES, hardened by tracking
+// ---------------------------------------------------------------------------
+// Until v3.3 the lock measured 5 frames spread across the WHOLE clip and
+// took the median, while the live (unlocked) render measures the playhead
+// frame — so on anything but a locked-off shot the two disagreed: the
+// screen-fixed region covers different content at those distant times, the
+// median collapsed, and locking visibly brought the noise back. (The second
+// half of the "lock brings the noise back" bug — v3.2 fixed the
+// region-ignored half.) v3.4 locks the PLAYHEAD measurement, hardened by a
+// short sweep of the frames around it: the patch content is tracked
+// frame-to-frame (SAD over sampled luma with a zero-motion prior, so
+// featureless patches stay put instead of random-walking, drift-capped),
+// measured at its tracked position, and a sweep frame only votes when its
+// measurement AGREES with the playhead's (sigma ratio + patch brightness) —
+// a car crossing the patch, an occlusion or a lost track simply drops out.
+// Worst case every helper is rejected and the lock is exactly the playhead
+// measurement: the user always gets what they were looking at.
+
+struct RegionTrack {
+    int dx = 0, dy = 0;    // cumulative pixel offset of the tracked patch
+    int ok = 1;            // 0 = track lost (drift cap exceeded)
+};
+
+// Mean sampled luma of the (offset) region — the cheap surface fingerprint
+// the acceptance test uses to notice "different content under the box".
+// Pass sizeN >= 2 for a whole-frame fingerprint.
+inline float regionMeanLuma(const float* rgba, int W, int H,
+                            float cxN, float cyN, float sizeN, int dx, int dy)
+{
+    const int half = std::max(4, static_cast<int>(0.5f * sizeN * static_cast<float>(std::min(W, H))));
+    const int cx = static_cast<int>(cxN * W) + dx;
+    const int cy = static_cast<int>(cyN * H) + dy;
+    const int step = std::max(1, half / 12);
+    float sum = 0.0f;
+    int n = 0;
+    for (int y = cy - half; y <= cy + half; y += step)
+        for (int x = cx - half; x <= cx + half; x += step) {
+            float Y, cb, cr;
+            nrcore::sampleYCC(rgba, W, H, x, y, Y, cb, cr);
+            sum += Y;
+            ++n;
+        }
+    return (n > 0) ? sum / static_cast<float>(n) : 0.0f;
+}
+
+// One tracking step: where did the patch under (cxN,cyN)+prevT move between
+// frame `prev` and frame `cur`? Integer SAD search over sampled luma within
+// +/-searchR of the previous offset, with a mild zero-motion prior — on a
+// featureless patch every candidate scores alike and the prior keeps the box
+// still. ok drops to 0 once the cumulative drift leaves the patch's own
+// neighbourhood (the measurement there would no longer be "the user's spot").
+inline RegionTrack trackRegionStep(const float* prev, const float* cur, int W, int H,
+                                   float cxN, float cyN, float sizeN,
+                                   const RegionTrack& prevT,
+                                   int searchR = 6, int maxDriftPx = 0)
+{
+    RegionTrack t = prevT;
+    if (!prevT.ok)
+        return t;
+    const int half = std::max(4, static_cast<int>(0.5f * sizeN * static_cast<float>(std::min(W, H))));
+    if (maxDriftPx <= 0)
+        maxDriftPx = (3 * half) / 4;
+    const int cx = static_cast<int>(cxN * W) + prevT.dx;
+    const int cy = static_cast<int>(cyN * H) + prevT.dy;
+    const int step = std::max(1, half / 12);
+
+    // reference grid from the previous frame, sampled once
+    std::vector<float> ref;
+    std::vector<int> gx, gy;
+    for (int y = cy - half; y <= cy + half; y += step)
+        for (int x = cx - half; x <= cx + half; x += step) {
+            float Y, cb, cr;
+            nrcore::sampleYCC(prev, W, H, x, y, Y, cb, cr);
+            ref.push_back(Y);
+            gx.push_back(x);
+            gy.push_back(y);
+        }
+    if (ref.size() < 16) {
+        t.ok = 0;
+        return t;
+    }
+
+    float bestScore = 0.0f;
+    int bestOx = 0, bestOy = 0;
+    bool first = true;
+    for (int oy = -searchR; oy <= searchR; ++oy) {
+        for (int ox = -searchR; ox <= searchR; ++ox) {
+            float sad = 0.0f;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                float Y, cb, cr;
+                nrcore::sampleYCC(cur, W, H, gx[i] + ox, gy[i] + oy, Y, cb, cr);
+                sad += std::fabs(Y - ref[i]);
+            }
+            const float score = sad * (1.0f + 0.02f * static_cast<float>(std::abs(ox) + std::abs(oy)));
+            if (first || score < bestScore) {
+                bestScore = score;
+                bestOx = ox;
+                bestOy = oy;
+                first = false;
+            }
+        }
+    }
+    t.dx = prevT.dx + bestOx;
+    t.dy = prevT.dy + bestOy;
+    t.ok = (std::abs(t.dx) <= maxDriftPx && std::abs(t.dy) <= maxDriftPx) ? 1 : 0;
+    return t;
+}
+
+// Sweep acceptance: does a tracked measurement describe the SAME noise the
+// user locked? Sigmas within [1/1.6, 1.6]x of the playhead's (the temporal
+// pair only when both frames had a diff partner) and patch brightness within
+// 0.13 — beyond either, the content under the box has changed and the frame
+// must not vote.
+inline bool sweepMeasurementMatches(const nrcore::Stats& anchor, float anchorLuma,
+                                    const nrcore::Stats& cand, float candLuma)
+{
+    const float kLo = 1.0f / 1.6f, kHi = 1.6f;
+    const float rS = cand.sy / std::max(anchor.sy, 1e-6f);
+    if (rS < kLo || rS > kHi)
+        return false;
+    if (anchor.hadTemporal && cand.hadTemporal) {
+        const float rT = cand.ty / std::max(anchor.ty, 1e-6f);
+        if (rT < kLo || rT > kHi)
+            return false;
+    }
+    return std::fabs(candLuma - anchorLuma) <= 0.13f;
+}
+
+// One measured frame of the sweep.
+struct SweepSample {
+    nrcore::Stats st;
+    float luma = 0.0f;     // region fingerprint at the tracked position
+    int dx = 0, dy = 0;    // tracked offset the measurement was taken at
+};
+
+struct LockSweep {
+    ClipAggregate agg;     // what to lock
+    int measured = 0;      // frames measured (anchor included)
+    int accepted = 0;      // frames that agreed with the playhead
+    int tracked = 0;       // 1 = region mode with at least one sweep frame
+    int driftPx = 0;       // largest accepted |offset| component
+};
+
+// Measure one frame at a tracked offset. ap carries profileSource/region and
+// MUST keep profileAdjust at 1 — locks store the RAW measurement, the trim
+// is applied at use time (v3.2 rule).
+inline void measureAtOffset(const float* frame, const float* partner, int W, int H,
+                            const nrcore::Params& ap, int dx, int dy, SweepSample& out)
+{
+    nrcore::Params fp = ap;
+    if (ap.profileSource == 1) {
+        const float nx = ap.regionCX + static_cast<float>(dx) / static_cast<float>(W);
+        const float ny = ap.regionCY + static_cast<float>(dy) / static_cast<float>(H);
+        fp.regionCX = std::min(1.0f, std::max(0.0f, nx));
+        fp.regionCY = std::min(1.0f, std::max(0.0f, ny));
+    }
+    nrcore::estimateInput(frame, partner, W, H, fp, out.st);
+    out.luma = (ap.profileSource == 1)
+             ? regionMeanLuma(frame, W, H, ap.regionCX, ap.regionCY, ap.regionSize, dx, dy)
+             : regionMeanLuma(frame, W, H, 0.5f, 0.5f, 2.0f, 0, 0);
+    out.dx = dx;
+    out.dy = dy;
+}
+
+// The playhead measurement always votes; helpers vote only when they agree.
+inline LockSweep composeLockAggregate(const SweepSample& anchor,
+                                      const std::vector<SweepSample>& others,
+                                      int tracked)
+{
+    LockSweep out;
+    out.tracked = tracked;
+    out.measured = 1 + static_cast<int>(others.size());
+    std::vector<nrcore::Stats> keep;
+    keep.push_back(anchor.st);
+    out.accepted = 1;
+    for (size_t i = 0; i < others.size(); ++i) {
+        const SweepSample& s = others[i];
+        if (!sweepMeasurementMatches(anchor.st, anchor.luma, s.st, s.luma))
+            continue;
+        keep.push_back(s.st);
+        ++out.accepted;
+        const int d = std::max(std::abs(s.dx), std::abs(s.dy));
+        if (d > out.driftPx)
+            out.driftPx = d;
+    }
+    out.agg = aggregateClipStats(keep);
+    return out;
+}
+
+// Reference orchestration over frames already in memory (tests use this; the
+// plugin runs a streaming port of the same loop — 2 frames resident instead
+// of 9 — feeding the same helpers, so the logic cannot diverge).
+inline LockSweep lockSweepAnalyze(const std::vector<const float*>& frames, int W, int H,
+                                  int anchorIdx, const nrcore::Params& ap)
+{
+    LockSweep bad;
+    const int n = static_cast<int>(frames.size());
+    if (n <= 0 || anchorIdx < 0 || anchorIdx >= n)
+        return bad;
+    const bool region = (ap.profileSource == 1);
+
+    SweepSample anchor;
+    const float* aPartner = (anchorIdx + 1 < n) ? frames[anchorIdx + 1]
+                          : (anchorIdx > 0 ? frames[anchorIdx - 1] : nullptr);
+    measureAtOffset(frames[anchorIdx], aPartner, W, H, ap, 0, 0, anchor);
+
+    std::vector<SweepSample> others;
+    RegionTrack tr;
+    for (int i = anchorIdx + 1; i < n; ++i) {           // forward
+        if (region) {
+            tr = trackRegionStep(frames[i - 1], frames[i], W, H,
+                                 ap.regionCX, ap.regionCY, ap.regionSize, tr);
+            if (!tr.ok)
+                break;
+        }
+        SweepSample s;
+        measureAtOffset(frames[i], frames[i - 1], W, H, ap, tr.dx, tr.dy, s);
+        others.push_back(s);
+    }
+    tr = RegionTrack();
+    for (int i = anchorIdx - 1; i >= 0; --i) {          // backward
+        if (region) {
+            tr = trackRegionStep(frames[i + 1], frames[i], W, H,
+                                 ap.regionCX, ap.regionCY, ap.regionSize, tr);
+            if (!tr.ok)
+                break;
+        }
+        SweepSample s;
+        measureAtOffset(frames[i], frames[i + 1], W, H, ap, tr.dx, tr.dy, s);
+        others.push_back(s);
+    }
+    return composeLockAggregate(anchor, others, (region && !others.empty()) ? 1 : 0);
+}
+
+// Status line for a Lock Profile click.
+inline std::string formatLockReport(const LockSweep& sw, int fromRegion)
+{
+    char buf[224];
+    if (sw.measured <= 0)
+        return std::string("Lock failed \xe2\x80\x94 could not read the clip.");
+    if (fromRegion && sw.tracked)
+        snprintf(buf, sizeof(buf),
+                 "Profile locked \xc2\xb7 region at the playhead, %d of %d nearby frames agreed "
+                 "(patch tracked, drift %d px) \xc2\xb7 noise %.1f%%Y / %.1f%%C",
+                 sw.accepted, sw.measured, sw.driftPx,
+                 sw.agg.sy * 100.0f, sw.agg.sc * 100.0f);
+    else
+        snprintf(buf, sizeof(buf),
+                 "Profile locked \xc2\xb7 %s at the playhead, %d of %d nearby frames agreed "
+                 "\xc2\xb7 noise %.1f%%Y / %.1f%%C",
+                 fromRegion ? "region" : "whole frame",
+                 sw.accepted, sw.measured,
+                 sw.agg.sy * 100.0f, sw.agg.sc * 100.0f);
+    return std::string(buf);
+}
+
+// Status line for the v3.4 Auto Region button.
+inline std::string formatRegionReport(const FlatPatch& fp, const nrcore::Stats& st)
+{
+    char buf[224];
+    snprintf(buf, sizeof(buf),
+             "Region placed on the flattest patch (%d%%, %d%%) \xc2\xb7 noise there %.1f%%Y / %.1f%%C "
+             "\xc2\xb7 it measures live \xe2\x80\x94 Lock Profile to freeze it, or run Auto Setup",
+             static_cast<int>(fp.cx * 100.0f + 0.5f),
+             static_cast<int>(fp.cy * 100.0f + 0.5f),
+             st.sy * 100.0f, st.sc * 100.0f);
+    return std::string(buf);
 }
 
 // ---------------------------------------------------------------------------
