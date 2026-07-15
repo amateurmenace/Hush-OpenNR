@@ -29,7 +29,11 @@ the stats-buffer slot layout (`NR_STATS_*`).
 cd test
 c++ -O2 -std=c++14 -I../plugin test_denoise.cpp -o test_denoise && ./test_denoise
 
-# GPU parity — runs the REAL RunMetalNR entry point vs the CPU reference
+# GPU parity — runs the REAL RunMetalNR entry point vs the CPU reference.
+# Tolerance modes: strict (max<5e-3, mean<1e-4); sparseOK for shift-search
+# selection races; hudOK for scope panels (display math like
+# int(sqrt(..)+0.5) bar heights flips ±1px under GPU fast-math — mean<5e-5
+# and <=400 pixels, any magnitude).
 c++ -O2 -std=c++14 -I../plugin test_metal.mm ../plugin/MetalKernel.mm \
     -framework Metal -framework Foundation -o test_metal && ./test_metal
 
@@ -60,7 +64,17 @@ c++ -O2 -std=c++14 -I../plugin bench_metal.mm ../plugin/MetalKernel.mm \
 ```
 
 CUDA (`CudaKernel.cu`) cannot be compiled or tested on this Mac — it is kept
-as a faithful textual port; treat it as unverified until CI builds it.
+as a faithful textual port; treat it as unverified until it has run on real
+NVIDIA hardware (the user is testing this on Windows: local CMake build with
+`-DHUSH_ENABLE_CUDA=ON`; flip the CI default only after parity-style
+verification there).
+
+**Golden policy:** the CPU suite pins default-output goldens (PSNR/meanAbs).
+Changes that keep defaults bit-exact must not touch them. An intentional
+default-path improvement re-pins the golden with a comment AND a CHANGELOG
+entry explaining why (precedent: v3.2 two-scale residual re-pinned the full
+static golden 40.927→40.948; the spatial goldens stayed bit-exact because
+the 0.9·coarse factor only engages on correlated noise).
 
 ## Release
 
@@ -99,14 +113,23 @@ Resolve uses on NVIDIA/AMD/Intel when CUDA isn't advertised. Do NOT add
 ## Screenshot / orientation gotcha
 
 OFX buffers are **bottom-up**; the test harness writes PPMs top-down (buffer
-row 0 first). Since v2.1 the Analysis HUD anchors in *display* space
-(`yd = H-1-y`), so in raw PPM/PNG test renders the HUD appears at the bottom,
-vertically mirrored — that is correct. To produce screenshots that look like
-Resolve, flip the render vertically (`sips --flip vertical`). Never flip a
-stale pre-fix PNG (that's how a mirrored HUD once shipped on the website).
-The website is built reproducibly: edit `site/index.template.html`, drop
-fresh JPEGs into `site/assets/{before,after,hud,snr}.jpg`, run
-`python3 site/build_site.py`. Never hand-edit the baked `site/index.html`.
+row 0 first). Since v2.1 the HUD/scopes anchor in *display* space
+(`yd = H-1-y`), so in raw PPM/PNG test renders the panels appear at the
+bottom, vertically mirrored — that is correct. To produce screenshots that
+look like Resolve, flip the render vertically (`sips --flip vertical`).
+Never flip a stale pre-fix PNG (that's how a mirrored HUD once shipped on
+the website).
+
+The website is built reproducibly: edit `site/index.template.html`, run
+`python3 site/build_site.py` (bakes base64 images into `site/index.html` and
+syncs `docs/` for GitHub Pages) then `python3 site/build_embed.py` (the
+scoped Squarespace fragment; images load from the Pages assets URLs). Never
+hand-edit the baked outputs. Image tokens live in BOTH scripts
+(`B64_AFTER/B64_BEFORE/B64_SCM/B64_SCMO/B64_SCEQ/B64_SCSNR/B64_WM`); new
+JS-referenced element ids must be added to build_embed.py's `ids` prefix
+list or the embed's interactions silently break. The per-scope 720p shots
+are regenerated with `test/site_shots.cpp` (see its header for the sips
+conversion lines).
 
 ## Distribution gotchas (learned the hard way)
 
@@ -125,42 +148,71 @@ fresh JPEGs into `site/assets/{before,after,hud,snr}.jpg`, run
   cache records the scan result (`status="0"` = loaded). Same plugin identifier
   at a higher version wins over the installed copy.
 
-## Algorithm summary (v1.2)
+## Algorithm summary (v3.2)
 
-1. **Noise profiling** (`estimateSigma` / NoiseEst+FinalizeStats kernels):
-   strided 2×2 sampling into six 256-bin histograms — fine |Laplacian| (Y, C),
+1. **Noise profiling** (`estimateInput` / NoiseEst+FinalizeStats kernels):
+   strided 2×2 sampling into 256-bin histograms — fine |Laplacian| (Y, C),
    coarse |Laplacian| on 2×2 block means (catches spatially-correlated noise),
    |temporal diff| vs a distinct neighbor frame (the primary estimator for
-   video; immune to spatial correlation). Robust statistics: medians, with the
-   temporal estimate taken as median if it agrees with the unbiased 20th
-   percentile (×1.4) else the quantile (motion robustness), rejected entirely
-   if > 3.5× the Laplacian family or ≤ 0.0015 (duplicate frame). Calibration
-   constants are derived in comments and verified by tests. Two sigma pairs
-   result: σ_S (spatial filtering) and σ_T (temporal gating).
-2. **Temporal merge**: per-pixel 3×3 patch mean |diff| against ±1/±2 frames;
-   **hard-knee gate** — full weight below lo = 1.128·σ_T (expected pure-noise
-   difference), smoothstep to exactly 0 at lo + (0.4+2.6·mt)·σ_T. No tail = no
-   ghosting by construction (v1.1's Gaussian tail caused "ghost soup" on real
-   footage). Chroma weight is multiplied by the luma gate. Outputs YCbCr +
-   effective sample count (effN) per pixel.
-3. **Spatial NLM**: 3×3 patches over a ±R window on the temporal result,
-   h = 1.15σ (luma) / 2.0σ (chroma) with σ_eff = σ_S/√effN, distances
-   bias-corrected by 2σ², edge-aware h reduction (Preserve Detail), luma-guided
-   chroma, max-neighbor-weight center trick. Faster mode = single-pixel
-   bilateral with spatial falloff.
-4. **Views**: result / split / noise-only / **Noise Analysis HUD** (5×7 pixel
-   font in `kFont[27]`, order "0-9.%ACEFILMOPRSTUY space"; meters, histogram
-   from the stats buffer, region rectangle) / **Temporal Activity** heat map
-   from effN. HUD panel is 300×134 local units scaled by max(1, H/540).
+   video; immune to spatial correlation), plus a 16-luma-bin brightness-
+   dependent gain curve (Q35 per bin, confidence-weighted, 3-tap smoothed).
+   Robust statistics with motion/duplicate guards; calibration constants
+   derived in comments and verified by tests. Exactly-flat samples (letterbox
+   bars, crushed blacks — zero Laplacian in all channels) are skipped (v3.1).
+   Two sigma pairs result: σ_S (spatial) and σ_T (temporal gating).
+   **Lock Profile** freezes a raw clip-aggregated snapshot (region-aware since
+   v3.2); Auto Profile Adjust multiplies locked values at USE time, so the
+   trim keeps working while locked.
+2. **Temporal merge**: per-pixel 3×3 patch mean |diff| against ±1/±2 frames,
+   shift-search **Motion Tracking** (±2 px, 9 candidates, 1% acceptance
+   margin, steeper roll-off for shifted winners), **firefly zapper**
+   (3-frame temporal median, three tests must agree). **Hard-knee gate** —
+   full weight below lo = 1.128·σ_T, smoothstep to exactly 0 at
+   lo + (0.4+2.6·mt)·σ_T; no tail = no ghosting by construction. v3.2 adds
+   **Ghost Guard**: a second knee on the SIGNED patch mean (noise cancels
+   signed, σ_mean = √2σ/3; knee start 1.128σ_T ≈ 2.4σ_mean, span
+   thrMul·σ_T/2) — catches slow coherent motion the magnitude gate can't
+   see, ~0.01 dB cost on static. Chroma slaved to the luma gate. Outputs
+   YCbCr + effective sample count (effN).
+3. **Residual re-measurement** on the merged image — at TWO scales since
+   v3.2 (fine + even-aligned 2×2 block Laplacian, ry = max(fine, 0.9·coarse),
+   capped at σ_S): compression blotch that survives the merge is larger than
+   a pixel and invisible to the fine estimator alone.
+4. **Spatial Noise EQ** on the residual measurement: fine NLM band (3×3
+   patches, ±R≤10, h = 1.15σ·hMul, bias-corrected, edge-aware Preserve
+   Detail), medium band (2×2 block-mean ring, 3–8 px), coarse luma band
+   (4×4 blocks, to ~47 px) and the chroma blotch pass (to ~23 px) — band
+   corrections clipped to noise scale. Sliders >100 widen tolerances/reach
+   (amounts cap at 1); ≤100 is bit-compatible with earlier releases.
+   **Detail Rescue** cores the fine band: correction clamped to
+   k = σ(2+6(1−r)) — crank strengths without blur.
+5. **Refine**: shadow desat, luma texture re-injection, gradient-aware
+   deband, deterministic film grain; then **Global Blend** (plain final
+   original↔result crossfade, identity short-circuit at 0).
+6. **Views + scopes**: views are full-image modes (result/split/input/
+   after-temporal/noise-removed with noise-adaptive soft-knee gain/HUD/
+   activity/SNR/matte); **scopes are per-step overlay panels** (Measurements
+   top-left, Noise EQ top-right, Motion mini-map bottom-right) that composite
+   over ANY view and never write alpha. 5×7 font in `kFont[43]`
+   ("0-9.%A-Z+ -|="), all text at 2× glyph scale on opaque panels (1-px
+   strokes decimated at fit zoom), sqrt-scaled histogram. Panel scale
+   max(1, H/540).
 
 ## UI philosophy
 
 Numbered steps teach the pipeline (1 Measure → 2 Temporal → 3 Spatial →
-4 Inspect). Every control's tooltip says what it does, when to touch it, and
-which direction to push it. Per-stage Enable toggles exist so users can see
-each stage's contribution. The viewer doubles as the scope because OFX can't
-draw charts in the Inspector — measurements are rendered into the image by the
-same kernels that use them, so the display can never disagree with the filter.
+4 Refine → 5 Inspect). Tooltips are 1–2 sentences (v3.1 cut them down from
+paragraphs). Per-stage Enable toggles show each stage's contribution;
+**Auto Setup** writes measured settings into the visible sliders (one-undo
+edit block); **Clean Slate** zeroes everything for fully-manual builds.
+Scope checkboxes live in the step they explain, and the EQ scope auto-shows
+on the first manual touch of an EQ slider (once per instance,
+`m_EqScopeShown`). The viewer doubles as the scope because OFX can't draw
+charts in the Inspector — measurements are rendered into the image by the
+same kernels that use them, so the display can never disagree with the
+filter. The plugin is color-space agnostic by design: it measures noise in
+whatever space the host hands it (per brightness band) instead of assuming
+one — don't add hidden colorimetric conversions.
 
 ## Repo layout
 

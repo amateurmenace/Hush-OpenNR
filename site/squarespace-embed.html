@@ -49,8 +49,11 @@
 #hush-embed .bars { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 0; }
 #hush-embed .bars span { flex: 1; }
 #hush-embed /* ---------- header ---------- */
-  header { padding: 30px 0 0; }
-#hush-embed .topline { display: flex; justify-content: space-between; align-items: center; font: 500 13px var(--mono); letter-spacing: .12em; color: var(--text-lt); text-transform: uppercase; }
+  /* header.wrap: class specificity so the top padding actually beats .wrap's
+     `padding: 0 24px` (a bare `header` rule loses and silently does nothing) */
+  header.wrap { padding: 52px 24px 0; }
+#hush-embed .topline { display: flex; justify-content: space-between; align-items: flex-start; gap: 36px; font: 500 13px var(--mono); letter-spacing: .12em; color: var(--text-lt); text-transform: uppercase; }
+#hush-embed .topline > span:last-child { flex: none; white-space: nowrap; }
 #hush-embed .topline a { color: var(--green-br); text-decoration: none; }
 #hush-embed .hero { display: grid; grid-template-columns: 1.05fr 1fr; gap: 44px; align-items: center; padding: 56px 0 64px; }
 
@@ -267,6 +270,11 @@
     statistics, careful signal processing, and honest engineering — plus the will to not
     charge for it. Hush gets you Studio-class results, free, with something even the paid
     tools don't offer: <b>total transparency into what it's measuring and doing.</b></p>
+    <p>And it's <b>color-space aware by design: it works natively in your timeline color
+    space</b> — Rec.709, log, or wide gamut. Because every threshold is calibrated from
+    what it <em>measures</em> (per brightness band, in the space your footage actually
+    lives in) rather than from assumptions about one, there's nothing to convert and
+    nothing to mismatch.</p>
   </div>
 </section>
 
@@ -544,7 +552,7 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
 <footer>
   <div class="wrap reg">
     <div class="bars" style="margin-bottom:28px"><span style="background:#3D5A47"></span><span style="background:#5B8C65"></span><span style="background:#A3C0B0"></span><span style="background:#E5A835"></span><span style="background:#E89D6B"></span><span style="background:#C5D6CC"></span><span style="background:#2D3A2E"></span></div>
-    <div class="credit">Produced by <a href="https://weirdmachine.org">Stephen Walter</a> and Claude Code in 2026.</div>
+    <div class="credit">Produced by <a href="https://weirdmachine.org">Stephen Walter</a> with DaVinci Resolve 21 and Claude Code in 2026.</div>
     <p class="credit2">An open-source tool of the <a href="https://communityai.studio">Community AI Project</a>,
     made in partnership with <a href="https://brooklineinteractive.org">Brookline Interactive Group</a>.</p>
     <a href="https://weirdmachine.org"><img class="wmlogo" src="https://amateurmenace.github.io/OpenNR/assets/wm-logo.png" alt="Weird Machine"></a>
