@@ -78,6 +78,18 @@ GitHub: repo `amateurmenace/OpenNR`; releases hold the pkg/zip artifacts
 (`gh release create vX.Y.Z release/*.pkg release/*.zip`). The portfolio page
 in `site/index.html` links to `releases/latest`.
 
+## Screenshot / orientation gotcha
+
+OFX buffers are **bottom-up**; the test harness writes PPMs top-down (buffer
+row 0 first). Since v2.1 the Analysis HUD anchors in *display* space
+(`yd = H-1-y`), so in raw PPM/PNG test renders the HUD appears at the bottom,
+vertically mirrored — that is correct. To produce screenshots that look like
+Resolve, flip the render vertically (`sips --flip vertical`). Never flip a
+stale pre-fix PNG (that's how a mirrored HUD once shipped on the website).
+The website is built reproducibly: edit `site/index.template.html`, drop
+fresh JPEGs into `site/assets/{before,after,hud,snr}.jpg`, run
+`python3 site/build_site.py`. Never hand-edit the baked `site/index.html`.
+
 ## Distribution gotchas (learned the hard way)
 
 - **Always set the deployment target.** Without `-mmacosx-version-min` the
