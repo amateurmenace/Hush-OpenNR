@@ -16,7 +16,7 @@ ifeq ($(UNAME_SYSTEM), Linux)
 	NVCCFLAGS = --compiler-options="-fPIC" -I.
 	LDFLAGS = -shared -fvisibility=hidden -L${CUDAPATH}/lib64 -lcuda -lcudart_static
 	BUNDLE_DIR = OpenNR.ofx.bundle/Contents/Linux-x86-64/
-	GPU_OBJ = CudaKernel.o OpenCLKernel.o
+	GPU_OBJ = CudaKernel.o OpenCLKernel.o SpeakCudaKernel.o SpeakOpenCLKernel.o
 else
 	# Deployment target matters: without it the binary inherits the build
 	# SDK's minimum OS and silently refuses to load on older Macs (Resolve
@@ -27,10 +27,11 @@ else
 	LDFLAGS = -bundle -fvisibility=hidden -F/Library/Frameworks -framework OpenCL -framework Metal -framework AppKit
 	LDFLAGS += ${ARCH_FLAGS}
 	BUNDLE_DIR = OpenNR.ofx.bundle/Contents/MacOS/
-	GPU_OBJ = MetalKernel.o OpenCLKernel.o
+	GPU_OBJ = MetalKernel.o OpenCLKernel.o SpeakMetalKernel.o SpeakOpenCLKernel.o
 endif
 
-OpenNR.ofx: OpenNRPlugin.o ${GPU_OBJ} ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o
+# The bundle exposes TWO plugins (Hush + Speak); both link into one OpenNR.ofx.
+OpenNR.ofx: OpenNRPlugin.o SpeakPlugin.o ${GPU_OBJ} ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
 	mkdir -p $(BUNDLE_DIR)
 	cp OpenNR.ofx $(BUNDLE_DIR)
@@ -39,7 +40,13 @@ OpenNR.ofx: OpenNRPlugin.o ${GPU_OBJ} ofxsCore.o ofxsImageEffect.o ofxsInteract.
 CudaKernel.o: CudaKernel.cu
 	${NVCC} -c $< $(NVCCFLAGS)
 
+SpeakCudaKernel.o: SpeakCudaKernel.cu
+	${NVCC} -c $< $(NVCCFLAGS)
+
 MetalKernel.o: MetalKernel.mm
+	$(CXX) -c $< $(CXXFLAGS)
+
+SpeakMetalKernel.o: SpeakMetalKernel.mm
 	$(CXX) -c $< $(CXXFLAGS)
 
 %.o: ../ofx/Support/Library/%.cpp

@@ -1904,8 +1904,14 @@ OFX::ImageEffect* OpenNRPluginFactory::createInstance(OfxImageEffectHandle p_Han
     return new OpenNRPlugin(p_Handle);
 }
 
+// Speak — the film-reconstruction node, registered as a SECOND plugin in the
+// same .ofx bundle (org.opennr.Speak). Forward-declared to keep this file
+// decoupled from SpeakPlugin.h; defined in SpeakPlugin.cpp.
+namespace speakofx { void registerSpeak(OFX::PluginFactoryArray& p_FactoryArray); }
+
 void OFX::Plugin::getPluginIDs(OFX::PluginFactoryArray& p_FactoryArray)
 {
     static OpenNRPluginFactory openNRPlugin;
     p_FactoryArray.push_back(&openNRPlugin);
+    speakofx::registerSpeak(p_FactoryArray);   // one bundle, two plugins
 }

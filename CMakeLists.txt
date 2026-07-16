@@ -20,6 +20,8 @@ set(SUPPORT ofx/Support/Library)
 add_library(OpenNR MODULE
     plugin/OpenNRPlugin.cpp
     plugin/OpenCLKernel.cpp
+    plugin/SpeakPlugin.cpp
+    plugin/SpeakOpenCLKernel.cpp
     ${SUPPORT}/ofxsCore.cpp
     ${SUPPORT}/ofxsImageEffect.cpp
     ${SUPPORT}/ofxsInteract.cpp
@@ -41,6 +43,6 @@ endif()
 
 if (HUSH_ENABLE_CUDA)
     enable_language(CUDA)
-    target_sources(OpenNR PRIVATE plugin/CudaKernel.cu)
+    target_sources(OpenNR PRIVATE plugin/CudaKernel.cu plugin/SpeakCudaKernel.cu)
     target_compile_definitions(OpenNR PRIVATE HUSH_ENABLE_CUDA)
 endif()

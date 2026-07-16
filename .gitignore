@@ -9,6 +9,10 @@ test/test_denoise
 test/test_metal
 test/bench_metal
 test/hush_cli
+test/test_speak
+test/test_speak_metal
+test/test_speak_opencl
+test/render_speak
 test/*.ppm
 test/*.png
 test/*.air
