@@ -298,11 +298,48 @@ static inline void setDyeCoupler(SpeakProfile& p, float amount)
 // with an 18% gray crosshair and R/G/B legend swatches. Text labels and the
 // live exposure histogram land in the next increment.
 // ---------------------------------------------------------------------------
+// The LOOK in working-space linear: decode, tone spine, subtractive color.
+// Shared by the pixel path and the density scope's measurement pass, so the
+// scope measures exactly what the pixels became — it cannot drift from them.
+static inline void lookLinear(float r, float g, float b, const SpeakParams& pr,
+                              float& oR, float& oG, float& oB)
+{
+    const SpeakProfile& p = pr.profile;
+    const int cs = pr.inputColorSpace;
+    const float lr = decodeToLinear(cs, r);
+    const float lg = decodeToLinear(cs, g);
+    const float lb = decodeToLinear(cs, b);
+    float mr = lr, mg = lg, mb = lb;
+    if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
+        const float s = clampf(pr.strength, 0.0f, 1.0f);
+        mr = lerpf(lr, toneChannel(lr, 0, p), s);
+        mg = lerpf(lg, toneChannel(lg, 1, p), s);
+        mb = lerpf(lb, toneChannel(lb, 2, p), s);
+    }
+    if ((pr.enableDye != 0) && dyeActive(p)) subtractiveColor(mr, mg, mb, p, mr, mg, mb);
+    oR = mr; oG = mg; oB = mb;
+}
+
 // ---------------------------------------------------------------------------
-// Scope statistics — the frame's own exposure distribution, measured on a
-// stride-2 grid and binned with integer counts (order-independent, so all four
-// backends land on identical bins).
+// Scope statistics — the frame's own exposure distribution, and the Status-M
+// density waveform of the RESULT, measured on a stride-2 grid and binned with
+// integer counts (order-independent, so all four backends land on identical
+// bins).
 // ---------------------------------------------------------------------------
+static inline int wfColOf(int x, int W)
+{
+    const int c = x * SPEAK_WF_COLS / (W > 0 ? W : 1);
+    return c < 0 ? 0 : (c >= SPEAK_WF_COLS ? SPEAK_WF_COLS - 1 : c);
+}
+static inline int wfRowOf(float D)
+{
+    const int r = static_cast<int>(D / SPEAK_WF_DMAX * SPEAK_WF_ROWS);
+    return r < 0 ? 0 : (r >= SPEAK_WF_ROWS ? SPEAK_WF_ROWS - 1 : r);
+}
+static inline int wfIdx(int ch, int col, int row)
+{
+    return SPEAK_STATS_WF + ch * (SPEAK_WF_COLS * SPEAK_WF_ROWS) + col * SPEAK_WF_ROWS + row;
+}
 static inline int expBinOf(float stops)
 {
     const int b = static_cast<int>((stops + 6.0f) / 12.0f * SPEAK_EXP_BINS);
@@ -318,17 +355,30 @@ static inline float pixelStops(int cs, float r, float g, float b)
 inline void computeStats(const float* src, int W, int H, const SpeakParams& pr, uint32_t* stats)
 {
     for (int i = 0; i < SPEAK_STATS_UINTS; ++i) stats[i] = 0u;
-    if (pr.scopeHD == 0) return;                       // only measured when shown
+    if (pr.scopeHD == 0 && pr.scopeDensity == 0) return;   // only measured when shown
     const int cs = pr.inputColorSpace;
     for (int y = 0; y < H; y += 2)
         for (int x = 0; x < W; x += 2) {
             const size_t i = (static_cast<size_t>(y) * W + x) * 4;
-            stats[SPEAK_STATS_HIST_EXP + expBinOf(pixelStops(cs, src[i], src[i + 1], src[i + 2]))]++;
+            if (pr.scopeHD != 0)
+                stats[SPEAK_STATS_HIST_EXP + expBinOf(pixelStops(cs, src[i], src[i + 1], src[i + 2]))]++;
+            if (pr.scopeDensity != 0) {
+                float mr, mg, mb;
+                lookLinear(src[i], src[i + 1], src[i + 2], pr, mr, mg, mb);
+                const int col = wfColOf(x, W);
+                stats[wfIdx(0, col, wfRowOf(density10(mr)))]++;
+                stats[wfIdx(1, col, wfRowOf(density10(mg)))]++;
+                stats[wfIdx(2, col, wfRowOf(density10(mb)))]++;
+            }
         }
     uint32_t mx = 0u;
     for (int b = 0; b < SPEAK_EXP_BINS; ++b)
         if (stats[SPEAK_STATS_HIST_EXP + b] > mx) mx = stats[SPEAK_STATS_HIST_EXP + b];
     stats[SPEAK_STATS_HIST_MAX] = mx;
+    uint32_t wmx = 0u;
+    for (int k = 0; k < SPEAK_WF_COLS * SPEAK_WF_ROWS * 3; ++k)
+        if (stats[SPEAK_STATS_WF + k] > wmx) wmx = stats[SPEAK_STATS_WF + k];
+    stats[SPEAK_STATS_WF_MAX] = wmx;
 }
 
 // The APPLIED transform for one input exposure, in stops. It mirrors the pixel
@@ -425,6 +475,66 @@ static inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams& p
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Status-M density scope: an RGB parade of the RESULT's film density, measured
+// from the frame by the same look the pixels get. Vertical axis is optical
+// density (0 = paper white at the top, SPEAK_WF_DMAX at the bottom) with
+// markers at paper white and 18% gray (D = -log10(0.18) = 0.745). Anchored
+// top-RIGHT in display space, so it sits beside the H&D scope.
+// ---------------------------------------------------------------------------
+static inline bool densityScopePixel(int x, int y, int W, int H, const SpeakParams& pr,
+                                     const uint32_t* stats,
+                                     float& outR, float& outG, float& outB)
+{
+    if (pr.scopeDensity == 0) return false;
+
+    const int sc = (H / 540) > 1 ? (H / 540) : 1;
+    const int panelW = 220 * sc, panelH = 150 * sc;
+    const int margin = 12 * sc;
+    const int px0 = W - margin - panelW, py0 = margin;   // top-right, display space
+    const int yd = H - 1 - y;
+    const int lx = x - px0, ly = yd - py0;
+    if (lx < 0 || ly < 0 || lx >= panelW || ly >= panelH) return false;
+
+    const int pad = 6 * sc;
+    const int plotW = panelW - 2 * pad, plotH = panelH - 2 * pad;
+    const int gx = lx - pad, gy = ly - pad;
+
+    outR = outG = outB = 0.06f;
+    if (lx < sc || ly < sc || lx >= panelW - sc || ly >= panelH - sc) {
+        outR = outG = outB = 0.30f; return true;
+    }
+    if (gx < 0 || gy < 0 || gx >= plotW || gy >= plotH) return true;
+
+    // Density markers: paper white (D=0, the top) and 18% gray.
+    const int rowGray = static_cast<int>(0.744727f / SPEAK_WF_DMAX * (plotH - 1) + 0.5f);
+    if (gy == 0) { outR = 0.35f; outG = 0.35f; outB = 0.35f; return true; }
+    if (gy == rowGray) { outR = 0.30f; outG = 0.26f; outB = 0.12f; return true; }
+
+    // The parade: three channel panes side by side.
+    const int chW = plotW / 3;
+    int ch = gx / (chW > 0 ? chW : 1);
+    if (ch > 2) ch = 2;
+    if (gx - ch * chW == 0 && ch > 0) { outR = outG = outB = 0.16f; return true; }  // pane divider
+
+    const uint32_t wmax = stats[SPEAK_STATS_WF_MAX];
+    if (wmax > 0u) {
+        const int within = gx - ch * chW;
+        const int wcol = within * SPEAK_WF_COLS / (chW > 0 ? chW : 1);
+        const int wrow = gy * SPEAK_WF_ROWS / plotH;
+        const uint32_t c = stats[wfIdx(ch, wcol < SPEAK_WF_COLS ? wcol : SPEAK_WF_COLS - 1,
+                                       wrow < SPEAK_WF_ROWS ? wrow : SPEAK_WF_ROWS - 1)];
+        if (c > 0u) {
+            const float inten = std::sqrt(static_cast<float>(c) / static_cast<float>(wmax));
+            const float v = 0.12f + 0.88f * (inten > 1.0f ? 1.0f : inten);
+            outR = (ch == 0) ? v : 0.05f;
+            outG = (ch == 1) ? v : 0.05f;
+            outB = (ch == 2) ? v : 0.05f;
+        }
+    }
+    return true;
+}
+
 // The INPUT pixel delivered through the same output CST as the result (no look
 // applied). Split/Input views use this so both halves of a comparison are in
 // the SAME space: in Bake mode both are Rec.709 (a valid look A/B), in Working
@@ -471,21 +581,10 @@ static inline void processPixel(float r, float g, float b,
         // may still overwrite below.
         outR = r; outG = g; outB = b;
     } else {
-        // Working-space linear result (look applied if any).
-        const float lr = decodeToLinear(cs, r);
-        const float lg = decodeToLinear(cs, g);
-        const float lb = decodeToLinear(cs, b);
-        float mr = lr, mg = lg, mb = lb;
-        if (toneOn) {
-            const float s = clampf(pr.strength, 0.0f, 1.0f);
-            mr = lerpf(lr, toneChannel(lr, 0, p), s);
-            mg = lerpf(lg, toneChannel(lg, 1, p), s);
-            mb = lerpf(lb, toneChannel(lb, 2, p), s);
-        }
-        // Subtractive color sits after the print curve, in the density domain
-        // (the spine's dye stage), and is standalone: it runs with the tone
-        // spine off so the knob works on any grade.
-        if (dyeOn) subtractiveColor(mr, mg, mb, p, mr, mg, mb);
+        // The look in working-space linear (tone spine + subtractive color) —
+        // the SAME function the density scope measures.
+        float mr, mg, mb;
+        lookLinear(r, g, b, pr, mr, mg, mb);
         if (bake) {
             // Output CST: gamut-convert to Rec.709 and encode gamma 2.4. Applies
             // regardless of the look (it is delivery, not a look) — a hard gamut
@@ -512,9 +611,10 @@ static inline void processPixel(float r, float g, float b,
         (pr.viewMode == SPEAK_VIEW_SPLIT && x < W / 2))
         deliverInput(pr, r, g, b, outR, outG, outB);
 
-    // Scopes render last, over any view.
+    // Scopes render last, over any view (each owns its own corner).
     float sr, sg, sb;
     if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
 }
 
 // ---------------------------------------------------------------------------

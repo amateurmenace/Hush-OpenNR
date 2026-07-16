@@ -134,6 +134,7 @@ public:
         m_DyeKnee       = fetchDoubleParam("dyeKnee");
         m_ViewMode      = fetchChoiceParam("viewMode");
         m_ScopeHD       = fetchBooleanParam("scopeHD");
+        m_ScopeDensity  = fetchBooleanParam("scopeDensity");
         updateEnabledness();
     }
 
@@ -154,7 +155,7 @@ public:
         m_OutputMode->getValueAtTime(t, om);
         if (vm != 0) return false;
         if (om != SPEAK_OUT_WORKING) return false;        // bake always transforms
-        if (m_ScopeHD->getValueAtTime(t)) return false;   // scope must still draw
+        if (m_ScopeHD->getValueAtTime(t) || m_ScopeDensity->getValueAtTime(t)) return false;  // scopes must still draw
         const bool toneOn = m_EnableTone->getValueAtTime(t) && (m_Strength->getValueAtTime(t) > 0.0);
         const bool dyeOn  = m_EnableDye->getValueAtTime(t) &&
                             (m_SubSat->getValueAtTime(t) > 0.0 || m_DyeCoupler->getValueAtTime(t) > 0.0);
@@ -202,7 +203,8 @@ private:
         p.enableDye       = m_EnableDye->getValueAtTime(t) ? 1 : 0;
         p.enableSplit = p.enableOptics = 0;
         p.scopeHD         = m_ScopeHD->getValueAtTime(t) ? 1 : 0;
-        p.scopeDensity = p.scopeVector = 0;
+        p.scopeDensity    = m_ScopeDensity->getValueAtTime(t) ? 1 : 0;
+        p.scopeVector     = 0;
 
         // Build the look profile: start from the gray-balanced Neutral stock and
         // apply the Phase-1 macro handles. Built-in stock families and Shoot-a-
@@ -304,6 +306,7 @@ private:
     OFX::DoubleParam*  m_DyeKnee;
     OFX::ChoiceParam*  m_ViewMode;
     OFX::BooleanParam* m_ScopeHD;
+    OFX::BooleanParam* m_ScopeDensity;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -499,8 +502,14 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
         page->addChild(*c);
     }
     sDefBool(p_Desc, page, "scopeHD", "Scope: H&D Curves",
-             "Draws the applied per-channel characteristic curves in the viewer — the exact "
-             "curve the pixels use, sampled from the render kernel. Turn off before rendering.",
+             "Draws the applied per-channel characteristic curves in the viewer (top-left) with "
+             "this frame's exposure histogram on the logE axis — the exact curve the pixels use, "
+             "sampled from the render kernel. Turn off before rendering.",
+             false, grpInspect);
+    sDefBool(p_Desc, page, "scopeDensity", "Scope: Density (Status-M)",
+             "Draws an RGB parade of the RESULT's film density in the viewer (top-right), with "
+             "markers at paper white and 18% gray. Measured from the frame by the same look the "
+             "pixels get. Turn off before rendering.",
              false, grpInspect);
 }
 

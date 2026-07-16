@@ -168,8 +168,13 @@ int main()
       speakcore::setDyeCoupler(p.profile, 0.7f);
       p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
       run(W, H, p, "tone + subtractive color", 0); }
-    if (atomicsOK) { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile(); run(W, H, p, "scope H&D on s0.6", 1); }
-    else           printf("  [SKIP] scope H&D on s0.6            (device's OpenCL atomics are broken)\n");
+    if (atomicsOK) {
+        { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile(); run(W, H, p, "scope H&D on s0.6", 1); }
+        { SpeakParams p = baseParams(); p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile(); run(W, H, p, "density scope on", 1); }
+        { SpeakParams p = baseParams(); p.scopeHD = 1; p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile(); run(W, H, p, "both scopes on", 1); }
+    } else {
+        printf("  [SKIP] scope H&D / density / both    (device's OpenCL atomics are broken)\n");
+    }
 
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);
     return g_fail ? 1 : 0;

@@ -41,6 +41,7 @@ int main(int argc, char** argv)
     p.enableTone = 1;
     p.strength = (argc > 1) ? float(atof(argv[1])) : 0.85f;
     p.scopeHD = 1;
+    p.scopeDensity = 1;
     p.profile = neutralProfile();
     // A warm behavioral stock: lower blue speed + printer trims (all
     // neutral-preserving on the gray axis).

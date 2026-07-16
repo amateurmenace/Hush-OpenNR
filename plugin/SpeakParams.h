@@ -144,6 +144,16 @@ typedef struct SpeakParams
 #define SPEAK_EXP_BINS       128  // scene log2-exposure bins over [-6,+6] stops
 #define SPEAK_STATS_HIST_EXP 0    // 128 bins: the frame's exposure distribution
 #define SPEAK_STATS_HIST_MAX 128  // the largest bin count (bar normalisation)
-#define SPEAK_STATS_UINTS    129
+
+// Status-M density waveform/parade. A FIXED grid (independent of the panel's
+// scale, so this buffer's size never depends on the image height): per channel,
+// 128 image-column buckets x 96 density buckets over [0, SPEAK_WF_DMAX] film
+// density. Channel-major: ch*(COLS*ROWS) + col*ROWS + row.
+#define SPEAK_WF_COLS        128
+#define SPEAK_WF_ROWS        96
+#define SPEAK_WF_DMAX        3.0f
+#define SPEAK_STATS_WF       129                       // 128*96*3 = 36864 cells
+#define SPEAK_STATS_WF_MAX   (129 + 36864)             // largest cell count
+#define SPEAK_STATS_UINTS    (129 + 36864 + 1)
 
 #endif // OPENNR_SPEAKPARAMS_H

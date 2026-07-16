@@ -143,6 +143,11 @@ int main()
       speakcore::setDyeCoupler(p.profile, 0.7f);
       p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
       run(device, queue, W, H, p, "tone + subtractive color", 0); }
+    // 5f — Status-M density scope (hud-tolerant: bar/parade display math).
+    { SpeakParams p = baseParams(); p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile();
+      run(device, queue, W, H, p, "density scope on", 1); }
+    { SpeakParams p = baseParams(); p.scopeHD = 1; p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile();
+      run(device, queue, W, H, p, "both scopes on", 1); }
     // 6 — H&D scope on (hud-tolerant).
     { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile();
       run(device, queue, W, H, p, "scope H&D on s0.6", 1); }

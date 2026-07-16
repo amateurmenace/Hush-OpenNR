@@ -127,6 +127,21 @@ __device__ inline float toneChannel(float lin, int ch, const SpeakProfile& p)
     float Dref = chainDensity(0.0f, ch, p);
     return k18Gray * pow10f(-(Dprn - Dref));
 }
+__device__ inline int wfColOf(int x, int W)
+{
+    int c = x * SPEAK_WF_COLS / (W > 0 ? W : 1);
+    return c < 0 ? 0 : (c >= SPEAK_WF_COLS ? SPEAK_WF_COLS - 1 : c);
+}
+__device__ inline int wfRowOf(float D)
+{
+    int r = (int)(D / SPEAK_WF_DMAX * SPEAK_WF_ROWS);
+    return r < 0 ? 0 : (r >= SPEAK_WF_ROWS ? SPEAK_WF_ROWS - 1 : r);
+}
+__device__ inline int wfIdx(int ch, int col, int row)
+{
+    return SPEAK_STATS_WF + ch * (SPEAK_WF_COLS * SPEAK_WF_ROWS) + col * SPEAK_WF_ROWS + row;
+}
+
 __device__ inline int expBinOf(float stops)
 {
     int b = (int)((stops + 6.0f) / 12.0f * SPEAK_EXP_BINS);
@@ -166,6 +181,24 @@ __device__ inline bool dyeActive(const SpeakProfile& p)
     return p.subSat[0] != 0.0f || p.subSat[1] != 0.0f || p.subSat[2] != 0.0f ||
            p.dyeCouple[1] != 0.0f || p.dyeCouple[2] != 0.0f || p.dyeCouple[3] != 0.0f ||
            p.dyeCouple[5] != 0.0f || p.dyeCouple[6] != 0.0f || p.dyeCouple[7] != 0.0f;
+}
+
+__device__ inline void lookLinear(float r, float g, float b, const SpeakParams& pr,
+                                  float& oR, float& oG, float& oB)
+{
+    int cs = pr.inputColorSpace;
+    float lr = decodeToLinear(cs, r);
+    float lg = decodeToLinear(cs, g);
+    float lb = decodeToLinear(cs, b);
+    float mr = lr, mg = lg, mb = lb;
+    if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
+        float s = clampf(pr.strength, 0.0f, 1.0f);
+        mr = lerpf(lr, toneChannel(lr, 0, pr.profile), s);
+        mg = lerpf(lg, toneChannel(lg, 1, pr.profile), s);
+        mb = lerpf(lb, toneChannel(lb, 2, pr.profile), s);
+    }
+    if ((pr.enableDye != 0) && dyeActive(pr.profile)) subtractiveColor(mr, mg, mb, pr.profile, mr, mg, mb);
+    oR = mr; oG = mg; oB = mb;
 }
 
 __device__ inline float scopeYStops(float inStops, int ch, const SpeakParams& pr)
@@ -244,6 +277,57 @@ __device__ inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParam
     return true;
 }
 
+__device__ inline bool densityScopePixel(int x, int y, int W, int H, const SpeakParams& pr,
+                                         const unsigned int* stats,
+                                         float& outR, float& outG, float& outB)
+{
+    if (pr.scopeDensity == 0) return false;
+
+    int sc = (H / 540) > 1 ? (H / 540) : 1;
+    int panelW = 220 * sc, panelH = 150 * sc;
+    int margin = 12 * sc;
+    int px0 = W - margin - panelW, py0 = margin;
+    int yd = H - 1 - y;
+    int lx = x - px0, ly = yd - py0;
+    if (lx < 0 || ly < 0 || lx >= panelW || ly >= panelH) return false;
+
+    int pad = 6 * sc;
+    int plotW = panelW - 2 * pad, plotH = panelH - 2 * pad;
+    int gx = lx - pad, gy = ly - pad;
+
+    outR = 0.06f; outG = 0.06f; outB = 0.06f;
+    if (lx < sc || ly < sc || lx >= panelW - sc || ly >= panelH - sc) {
+        outR = 0.30f; outG = 0.30f; outB = 0.30f; return true;
+    }
+    if (gx < 0 || gy < 0 || gx >= plotW || gy >= plotH) return true;
+
+    int rowGray = (int)(0.744727f / SPEAK_WF_DMAX * (plotH - 1) + 0.5f);
+    if (gy == 0) { outR = 0.35f; outG = 0.35f; outB = 0.35f; return true; }
+    if (gy == rowGray) { outR = 0.30f; outG = 0.26f; outB = 0.12f; return true; }
+
+    int chW = plotW / 3;
+    int ch = gx / (chW > 0 ? chW : 1);
+    if (ch > 2) ch = 2;
+    if (gx - ch * chW == 0 && ch > 0) { outR = 0.16f; outG = 0.16f; outB = 0.16f; return true; }
+
+    unsigned int wmax = stats[SPEAK_STATS_WF_MAX];
+    if (wmax > 0u) {
+        int within = gx - ch * chW;
+        int wcol = within * SPEAK_WF_COLS / (chW > 0 ? chW : 1);
+        int wrow = gy * SPEAK_WF_ROWS / plotH;
+        unsigned int c = stats[wfIdx(ch, wcol < SPEAK_WF_COLS ? wcol : SPEAK_WF_COLS - 1,
+                                     wrow < SPEAK_WF_ROWS ? wrow : SPEAK_WF_ROWS - 1)];
+        if (c > 0u) {
+            float inten = sqrtf((float)c / (float)wmax);
+            float v = 0.12f + 0.88f * (inten > 1.0f ? 1.0f : inten);
+            outR = (ch == 0) ? v : 0.05f;
+            outG = (ch == 1) ? v : 0.05f;
+            outB = (ch == 2) ? v : 0.05f;
+        }
+    }
+    return true;
+}
+
 __device__ inline void deliverInput(const SpeakParams& pr, float r, float g, float b,
                                     float& oR, float& oG, float& oB)
 {
@@ -276,17 +360,8 @@ __device__ inline void processPixel(float r, float g, float b, int x, int y, int
     if (!toneOn && !dyeOn && !bake) {
         outR = r; outG = g; outB = b;
     } else {
-        float lr = decodeToLinear(cs, r);
-        float lg = decodeToLinear(cs, g);
-        float lb = decodeToLinear(cs, b);
-        float mr = lr, mg = lg, mb = lb;
-        if (toneOn) {
-            float s = clampf(pr.strength, 0.0f, 1.0f);
-            mr = lerpf(lr, toneChannel(lr, 0, pr.profile), s);
-            mg = lerpf(lg, toneChannel(lg, 1, pr.profile), s);
-            mb = lerpf(lb, toneChannel(lb, 2, pr.profile), s);
-        }
-        if (dyeOn) subtractiveColor(mr, mg, mb, pr.profile, mr, mg, mb);
+        float mr, mg, mb;
+        lookLinear(r, g, b, pr, mr, mg, mb);
         if (bake) {
             float rr, rg, rb;
             gamutToRec709Lin(cs, mr, mg, mb, rr, rg, rb);
@@ -307,10 +382,11 @@ __device__ inline void processPixel(float r, float g, float b, int x, int y, int
 
     float sr, sg, sb;
     if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
 }
 
-// Scope measurement pass: bin the frame's exposure on a stride-2 grid. Integer
-// atomics are order-independent, so the counts are identical on every backend.
+// Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
+// order-independent, so the counts are identical on every backend.
 __global__ void SpeakStatsKernel(SpeakParams p, int W, int H,
                                  const float4* src, unsigned int* stats)
 {
@@ -318,8 +394,18 @@ __global__ void SpeakStatsKernel(SpeakParams p, int W, int H,
     int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
     if (x >= W || y >= H) return;
     float4 s = src[y * W + x];
-    int bin = expBinOf(pixelStops(p.inputColorSpace, s.x, s.y, s.z));
-    atomicAdd(&stats[SPEAK_STATS_HIST_EXP + bin], 1u);
+    if (p.scopeHD != 0) {
+        int bin = expBinOf(pixelStops(p.inputColorSpace, s.x, s.y, s.z));
+        atomicAdd(&stats[SPEAK_STATS_HIST_EXP + bin], 1u);
+    }
+    if (p.scopeDensity != 0) {
+        float mr, mg, mb;
+        lookLinear(s.x, s.y, s.z, p, mr, mg, mb);
+        int col = wfColOf(x, W);
+        atomicAdd(&stats[wfIdx(0, col, wfRowOf(density10(mr)))], 1u);
+        atomicAdd(&stats[wfIdx(1, col, wfRowOf(density10(mg)))], 1u);
+        atomicAdd(&stats[wfIdx(2, col, wfRowOf(density10(mb)))], 1u);
+    }
 }
 
 __global__ void SpeakStatsMaxKernel(unsigned int* stats)
@@ -328,6 +414,10 @@ __global__ void SpeakStatsMaxKernel(unsigned int* stats)
     for (int b = 0; b < SPEAK_EXP_BINS; ++b)
         if (stats[SPEAK_STATS_HIST_EXP + b] > mx) mx = stats[SPEAK_STATS_HIST_EXP + b];
     stats[SPEAK_STATS_HIST_MAX] = mx;
+    unsigned int wmx = 0u;
+    for (int k = 0; k < SPEAK_WF_COLS * SPEAK_WF_ROWS * 3; ++k)
+        if (stats[SPEAK_STATS_WF + k] > wmx) wmx = stats[SPEAK_STATS_WF + k];
+    stats[SPEAK_STATS_WF_MAX] = wmx;
 }
 
 __global__ void SpeakKernel(SpeakParams p, int W, int H,
@@ -362,7 +452,7 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
 
     dim3 block(16, 16, 1);
     cudaMemsetAsync(r.stats, 0, SPEAK_STATS_UINTS * sizeof(unsigned int), stream);
-    if (p_Params.scopeHD != 0) {
+    if (p_Params.scopeHD != 0 || p_Params.scopeDensity != 0) {
         dim3 gridH((p_Width / 2 + block.x - 1) / block.x, (p_Height / 2 + block.y - 1) / block.y, 1);
         SpeakStatsKernel<<<gridH, block, 0, stream>>>(p_Params, p_Width, p_Height,
                                                       reinterpret_cast<const float4*>(p_Src), r.stats);
