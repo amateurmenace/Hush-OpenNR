@@ -141,6 +141,10 @@ public:
         m_SplitHighB    = fetchDoubleParam("splitHighB");
         m_SplitPivot    = fetchDoubleParam("splitPivot");
         m_SplitBalance  = fetchDoubleParam("splitBalance");
+        m_EnableOptics  = fetchBooleanParam("enableOptics");
+        m_HalAmount     = fetchDoubleParam("halAmount");
+        m_HalRadius     = fetchDoubleParam("halRadius");
+        m_HalThresh     = fetchDoubleParam("halThresh");
         m_ViewMode      = fetchChoiceParam("viewMode");
         m_ScopeHD       = fetchBooleanParam("scopeHD");
         m_ScopeDensity  = fetchBooleanParam("scopeDensity");
@@ -172,6 +176,8 @@ public:
                              (m_SplitShadowR->getValueAtTime(t) != 0.0 || m_SplitShadowG->getValueAtTime(t) != 0.0 ||
                               m_SplitShadowB->getValueAtTime(t) != 0.0 || m_SplitHighR->getValueAtTime(t) != 0.0 ||
                               m_SplitHighG->getValueAtTime(t) != 0.0 || m_SplitHighB->getValueAtTime(t) != 0.0);
+        // Halation only exists inside the tone spine (it re-exposes the
+        // negative), so it cannot make the node non-identity on its own.
         if (!toneOn && !dyeOn && !splitOn) { p_IdentityClip = m_SrcClip; p_IdentityTime = t; return true; }
         return false;
     }
@@ -179,7 +185,7 @@ public:
     virtual void changedParam(const OFX::InstanceChangedArgs& /*p_Args*/, const std::string& p_ParamName)
     {
         if (p_ParamName == "enableTone" || p_ParamName == "enableDye" ||
-            p_ParamName == "enableSplit") updateEnabledness();
+            p_ParamName == "enableSplit" || p_ParamName == "enableOptics") updateEnabledness();
     }
 
 private:
@@ -202,6 +208,17 @@ private:
         m_SplitShadowR->setEnabled(sp); m_SplitShadowG->setEnabled(sp); m_SplitShadowB->setEnabled(sp);
         m_SplitHighR->setEnabled(sp); m_SplitHighG->setEnabled(sp); m_SplitHighB->setEnabled(sp);
         m_SplitPivot->setEnabled(sp); m_SplitBalance->setEnabled(sp);
+        // Halation needs BOTH its own stage and the tone spine: it re-exposes the
+        // NEGATIVE, so with Film Tone off there is no negative and the controls
+        // would do literally nothing (worse — injecting scatter into linear with
+        // no curve downstream is exactly the end-chain overlay the control arm
+        // rejected). Greyed rather than silently inert; the group hint says why.
+        // Gated on the ENABLE toggles only, never on Strength's value — that
+        // matches every other group here and lets a user dial halation in before
+        // bringing Strength up.
+        const bool op = m_EnableOptics->getValue() && m_EnableTone->getValue();
+        m_HalAmount->setEnabled(op); m_HalRadius->setEnabled(op); m_HalThresh->setEnabled(op);
+        m_EnableOptics->setEnabled(m_EnableTone->getValue());
     }
 
     SpeakParams gatherParams(double t)
@@ -220,7 +237,7 @@ private:
         p.enableTone      = m_EnableTone->getValueAtTime(t) ? 1 : 0;
         p.enableDye       = m_EnableDye->getValueAtTime(t) ? 1 : 0;
         p.enableSplit     = m_EnableSplit->getValueAtTime(t) ? 1 : 0;
-        p.enableOptics    = 0;
+        p.enableOptics    = m_EnableOptics->getValueAtTime(t) ? 1 : 0;
         p.scopeHD         = m_ScopeHD->getValueAtTime(t) ? 1 : 0;
         p.scopeDensity    = m_ScopeDensity->getValueAtTime(t) ? 1 : 0;
         p.scopeVector     = 0;
@@ -258,6 +275,13 @@ private:
         prof.splitHigh[2]   = static_cast<float>(m_SplitHighB->getValueAtTime(t));
         prof.splitPivot     = static_cast<float>(m_SplitPivot->getValueAtTime(t));
         prof.splitBalance   = static_cast<float>(m_SplitBalance->getValueAtTime(t));
+
+        // Halation (Phase 4): scattered light re-exposing the negative. The
+        // radius is a % of frame height, so the look survives a proxy/full-res
+        // switch (speak_core.h halSigmaPx; gated by G16).
+        prof.halAmount = static_cast<float>(m_HalAmount->getValueAtTime(t));
+        prof.halRadius = static_cast<float>(m_HalRadius->getValueAtTime(t));
+        prof.halThresh = static_cast<float>(m_HalThresh->getValueAtTime(t));
 
         p.profile = prof;
         return p;
@@ -342,6 +366,10 @@ private:
     OFX::DoubleParam*  m_SplitHighB;
     OFX::DoubleParam*  m_SplitPivot;
     OFX::DoubleParam*  m_SplitBalance;
+    OFX::BooleanParam* m_EnableOptics;
+    OFX::DoubleParam*  m_HalAmount;
+    OFX::DoubleParam*  m_HalRadius;
+    OFX::DoubleParam*  m_HalThresh;
     OFX::ChoiceParam*  m_ViewMode;
     OFX::BooleanParam* m_ScopeHD;
     OFX::BooleanParam* m_ScopeDensity;
@@ -556,18 +584,51 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "How wide the untouched mid zone is. Narrow = shadows and highlights tint close to "
                "mid-gray; wide = only the extremes tint.", 0.5, 0.0, 1.0, 0.01, grpSplit);
 
-    // -------------------------------------------------------------- 5 · Inspect
+    // ---------------------------------------------------------------- 5 · Light
+    // Halation is the first spatial module. Its controls are deliberately few:
+    // every exposed knob is an honesty liability, and the AH weighting is a
+    // modelled default gated by test/proto_halation.cpp rather than a knob.
+    OFX::GroupParamDescriptor* grpLight = p_Desc.defineGroupParam("grpLight");
+    grpLight->setLabels("5 \xC2\xB7 Light", "5 \xC2\xB7 Light", "5 \xC2\xB7 Light");
+    grpLight->setOpen(true);
+    grpLight->setHint("Light scattering in the film itself. Halation is light that passed through "
+                      "the emulsion, bounced off the base and re-exposed the negative from behind — "
+                      "so it is added as exposure before the curve, and the print's shoulder is what "
+                      "makes the halo bloom white-hot instead of glowing pure red. Needs Film Tone "
+                      "on: with no negative there is nothing to re-expose. Set View to Halation "
+                      "Scatter to see the light it is adding, on its own.");
+
+    sDefBool(p_Desc, page, "enableOptics", "Enable Light",
+             "Toggle halation to compare against the same grade without it.", false, grpLight);
+    sDefDouble(p_Desc, page, "halAmount", "Halation",
+               "How much scattered light re-exposes the negative. 0 is off and is bit-exact "
+               "identity — the whole scatter pass is skipped. Raise for the red bloom around "
+               "highlights that reads as film.", 0.0, 0.0, 2.0, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "halRadius", "Halation Radius",
+               "How far the light spreads, as a percentage of frame HEIGHT — so the look is "
+               "identical on a proxy and at full res. Around 1% is the order of real 35mm "
+               "base-reflection geometry; it is a starting point, not a measured stock.",
+               1.0, 0.05, 8.0, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "halThresh", "Halation Threshold",
+               "Scene-linear level above which light scatters. This is a practical control for "
+               "keeping the effect in the highlights, not a property of film — real emulsion "
+               "scatters every photon.", 0.6, 0.0, 8.0, 0.01, grpLight);
+
+    // -------------------------------------------------------------- 6 · Inspect
     OFX::GroupParamDescriptor* grpInspect = p_Desc.defineGroupParam("grpInspect");
-    grpInspect->setLabels("5 \xC2\xB7 Inspect", "5 \xC2\xB7 Inspect", "5 \xC2\xB7 Inspect");
+    grpInspect->setLabels("6 \xC2\xB7 Inspect", "6 \xC2\xB7 Inspect", "6 \xC2\xB7 Inspect");
     grpInspect->setOpen(true);
     grpInspect->setHint("Views and the read-only scopes. Turn scopes off before rendering.");
     {
         OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("viewMode");
         c->setLabels("View", "View", "View");
-        c->setHint("Result / Split (input | result) / Input for comparing.");
+        c->setHint("Result / Split (input | result) / Input for comparing. Halation Scatter shows "
+                   "the scattered light on its own, in the same units as the picture — it is not "
+                   "brightened to look impressive, so a small halo correctly looks small.");
         c->appendOption("Result");
         c->appendOption("Split (Input | Result)");
         c->appendOption("Input (Original)");
+        c->appendOption("Halation Scatter (isolated)");
         c->setDefault(SPEAK_VIEW_RESULT);
         c->setParent(*grpInspect);
         page->addChild(*c);

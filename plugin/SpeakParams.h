@@ -76,6 +76,15 @@ typedef struct SpeakProfile
     float splitPivot;     // tonal pivot (stops, rel. 18% gray) for the split
     float splitBalance;   // shadow/highlight weighting knob
 
+    // ---- Halation (Phase 4 — the first spatial module) ----
+    // Scattered light that re-exposes the NEGATIVE, so it is injected as
+    // exposure (additive in scene-linear) ahead of the whole density spine.
+    // See speak_core.h for the physics and for why there is no injection in
+    // the negative->print gap.
+    float halAmount;      // 0 = off (bit-exact identity); scales the re-exposure
+    float halRadius;      // scatter radius as % of FRAME HEIGHT (format-relative)
+    float halThresh;      // scene-linear highlight threshold that feeds the scatter
+
     // ---- meta ----
     float systemGamma;    // target overall system gamma (~1.6), for the scope
     int   residualLUT;    // 0 = separable model only, 1 = 3D residual cube on
@@ -105,6 +114,7 @@ typedef struct SpeakProfile
 #define SPEAK_VIEW_RESULT         0
 #define SPEAK_VIEW_SPLIT          1   // input | result
 #define SPEAK_VIEW_INPUT          2
+#define SPEAK_VIEW_SCATTER        3   // the isolated halation scatter field
 
 typedef struct SpeakParams
 {
@@ -155,5 +165,37 @@ typedef struct SpeakParams
 #define SPEAK_STATS_WF       129                       // 128*96*3 = 36864 cells
 #define SPEAK_STATS_WF_MAX   (129 + 36864)             // largest cell count
 #define SPEAK_STATS_UINTS    (129 + 36864 + 1)
+
+// ---------------------------------------------------------------------------
+// The shared separable scatter pyramid (Phase 4). One energy-normalized pyramid
+// is built on the per-channel scene-linear highlight excess and read back at
+// full resolution as a weighted mixture of octave levels. Halation reads it
+// today; bloom will read the SAME pyramid with broader weights (spec 1B.5).
+//
+// WHY A PYRAMID, MEASURED (not assumed — this repo builds no architecture
+// without a measurement). Metal, UHD 3840x2160, 3 channels, per frame:
+//     radius   sigma   taps   direct separable   this pyramid
+//      0.5%     19.2    117        45.1 ms          5.0 ms
+//      1.0%     38.4    233        85.2 ms          9.9 ms
+//      2.0%     76.8    463       170.7 ms          6.8 ms
+//      4.09%   157.1    945       333.3 ms          9.5 ms
+// The direct blur is O(radius) and misses real-time at EVERY setting (Hush
+// renders its whole pipeline at 38.7 ms UHD). The pyramid is ~flat in radius.
+// That flatness is the architectural property; it is why the radius control can
+// be a real slider instead of a performance cliff.
+//
+// Levels are 4x4-binomial-decimated ([1,3,3,1]/8 separable, 16 taps), which is
+// mean-preserving, deterministic and needs no atomics — so it is immune to the
+// Apple-OpenCL atomics bug that forces the stats pass to be skipped there.
+// The level count must be governed by MINDIM, never by MAXLEV. The mixture's
+// skirt spans (nLev - L_target) octaves; nLev ~ log2(H/MINDIM) and L_target ~
+// log2(radius% * H / C), so their DIFFERENCE is independent of frame height —
+// which is exactly what makes the halo resolution-independent (G16). A MAXLEV
+// that binds breaks that: at 9 it truncated UHD's skirt to 12.4% missing weight
+// against 6.3% at 1080p and below, i.e. UHD rendered a different halo from the
+// proxy the shot was graded on. MAXLEV is now only a runaway guard.
+#define SPEAK_HAL_MAXLEV     14   // guard only — MINDIM must be what binds
+#define SPEAK_HAL_MINDIM     8    // stop decimating below this level dimension
+#define SPEAK_HAL_SIGMA_MIN  0.05f // sigma floor: halRadius=0 would divide by zero
 
 #endif // OPENNR_SPEAKPARAMS_H

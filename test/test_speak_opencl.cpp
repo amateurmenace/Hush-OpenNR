@@ -58,6 +58,21 @@ static SpeakProfile stockProfile()
     p.printerMaster = 0.8f;
     return p;
 }
+// Halation on: the scatter pyramid is live, so the three extra passes and the
+// size-dependent arena/scat buffers all get exercised. enableOptics gates the
+// amount (halAmountOf) and the tone spine must be on for any of it to reach the
+// pixels — halation re-exposes the NEGATIVE.
+static SpeakParams halParams()
+{
+    SpeakParams p = baseParams();
+    p.inputColorSpace = SPEAK_CS_LINEAR;   // scene-linear in: the disc is a real highlight
+    p.profile = stockProfile();
+    p.enableOptics = 1;
+    p.profile.halAmount = 0.5f;
+    p.profile.halRadius = 1.0f;
+    p.profile.halThresh = 0.6f;
+    return p;
+}
 
 static cl_context g_ctx; static cl_command_queue g_q; static cl_device_id g_dev;
 
@@ -94,9 +109,33 @@ static bool atomicsWork()
     return (out[0] + out[1] + out[2] + out[3]) == 1000u;
 }
 
-static void run(int W, int H, const SpeakParams& p, const char* label, int mode)
+// A frame with a REAL HIGHLIGHT (mirrors test_speak_metal.mm): a hot disc plus a
+// saturated blue lamp on a dim field. The smooth gradient in makeFrame barely
+// exercises a scatter pyramid — no sharp highlight edge to reveal a wrong
+// octave, no saturated source to reveal a per-channel scatter error.
+static std::vector<float> makeHotFrame(int W, int H)
 {
-    std::vector<float> src = makeFrame(W, H);
+    std::vector<float> f(static_cast<size_t>(W) * H * 4);
+    const float cx = W * 0.42f, cy = H * 0.45f, rad = W * 0.09f;
+    const float bx = W * 0.75f, by = H * 0.70f, brad = W * 0.05f;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const float d = std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+            const float db = std::sqrt((x - bx) * (x - bx) + (y - by) * (y - by));
+            if (d <= rad)        { f[i + 0] = 9.0f;  f[i + 1] = 8.2f;  f[i + 2] = 7.0f; }
+            else if (db <= brad) { f[i + 0] = 0.02f; f[i + 1] = 0.05f; f[i + 2] = 6.0f; }
+            else                 { f[i + 0] = 0.05f + 0.20f * (static_cast<float>(x) / (W - 1));
+                                   f[i + 1] = 0.07f;
+                                   f[i + 2] = 0.12f + 0.10f * (static_cast<float>(y) / (H - 1)); }
+            f[i + 3] = 1.0f;
+        }
+    return f;
+}
+
+static void runSrc(int W, int H, const SpeakParams& p, const char* label, int mode,
+                   const std::vector<float>& src)
+{
     const size_t n = static_cast<size_t>(W) * H * 4;
     const size_t bytes = n * sizeof(float);
 
@@ -104,7 +143,8 @@ static void run(int W, int H, const SpeakParams& p, const char* label, int mode)
     speakcore::speakFrame(src.data(), W, H, p, cpu.data());
 
     cl_int err;
-    cl_mem srcBuf = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, src.data(), &err);
+    cl_mem srcBuf = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes,
+                                   const_cast<float*>(src.data()), &err);
     cl_mem dstBuf = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, bytes, NULL, &err);
 
     RunOpenCLSpeak((void*)g_q, W, H, p, (const float*)srcBuf, (float*)dstBuf);
@@ -126,6 +166,15 @@ static void run(int W, int H, const SpeakParams& p, const char* label, int mode)
     printf("  [%s] %-30s max %.2e  mean %.2e  over %zu\n", pass ? "PASS" : "FAIL", label, maxd, meand, nOver);
     if (!pass) g_fail++;
     clReleaseMemObject(srcBuf); clReleaseMemObject(dstBuf);
+}
+
+static void run(int W, int H, const SpeakParams& p, const char* label, int mode)
+{
+    runSrc(W, H, p, label, mode, makeFrame(W, H));
+}
+static void runHot(int W, int H, const SpeakParams& p, const char* label, int mode)
+{
+    runSrc(W, H, p, label, mode, makeHotFrame(W, H));
 }
 
 int main()
@@ -168,10 +217,39 @@ int main()
       speakcore::setDyeCoupler(p.profile, 0.7f);
       p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
       run(W, H, p, "tone + subtractive color", 0); }
+    // ---- halation: the scatter pyramid (atomics-free, so it runs everywhere) ----
+    { SpeakParams p = halParams(); runHot(W, H, p, "halation s1.0 r1.0%", 0); }
+    { SpeakParams p = halParams(); p.profile.halRadius = 4.0f; p.profile.halAmount = 0.9f;
+      runHot(W, H, p, "halation wide r4.0% a0.9", 0); }
+    { SpeakParams p = halParams(); p.profile.halRadius = 0.15f; runHot(W, H, p, "halation tight r0.15%", 0); }
+    { SpeakParams p = halParams(); p.strength = 0.4f; runHot(W, H, p, "halation s0.4 (dry side = lr)", 0); }
+    { SpeakParams p = halParams(); p.viewMode = SPEAK_VIEW_SCATTER; runHot(W, H, p, "scatter view", 0); }
+    { SpeakParams p = halParams(); p.outputMode = SPEAK_OUT_BAKE_REC709; runHot(W, H, p, "halation + bake Rec.709", 2); }
+    { SpeakParams p = halParams(); p.enableDye = 1;
+      p.profile.subSat[0] = p.profile.subSat[1] = p.profile.subSat[2] = 0.8f;
+      speakcore::setDyeCoupler(p.profile, 0.7f);
+      runHot(W, H, p, "halation + subtractive color", 0); }
+    // enableOptics off => halAmountOf 0 => the whole chain is skipped; must be
+    // bit-identical to the no-halation build (the identity gate on the GPU side).
+    { SpeakParams p = halParams(); p.enableOptics = 0; runHot(W, H, p, "halation optics-off (skipped)", 0); }
+    { SpeakParams p = halParams(); p.profile.halAmount = 0.0f; runHot(W, H, p, "halation amount 0 (skipped)", 0); }
+    // Odd, non-power-of-two sizes: exercises the (w+1)/2 level ladder, the
+    // clamped edge fetch and the per-level dispatch rounding.
+    { SpeakParams p = halParams(); runHot(173, 97, p, "halation odd size 173x97", 0); }
+    { SpeakParams p = halParams(); runHot(31, 19, p, "halation tiny 31x19", 0); }
+    // Same params at two sizes: the size-dependent buffers must grow, not overrun
+    // (the proxy -> full-res switch, on ONE cached queue).
+    { SpeakParams p = halParams(); runHot(320, 240, p, "halation proxy 320x240", 0); }
+    { SpeakParams p = halParams(); runHot(1024, 576, p, "halation full-res 1024x576", 0); }
+
     if (atomicsOK) {
-        { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile(); run(W, H, p, "scope H&D on s0.6", 1); }
-        { SpeakParams p = baseParams(); p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile(); run(W, H, p, "density scope on", 1); }
-        { SpeakParams p = baseParams(); p.scopeHD = 1; p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile(); run(W, H, p, "both scopes on", 1); }
+        { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile(); runHot(W, H, p, "scope H&D on s0.6", 1); }
+        // The density parade must measure the HALATED result — a scatter-blind
+        // scope is a bug parity cannot catch, so this case only means anything
+        // because the CPU reference it is compared against reads the plane too.
+        { SpeakParams p = halParams(); p.scopeDensity = 1; runHot(W, H, p, "density scope + halation", 1); }
+        { SpeakParams p = baseParams(); p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile(); runHot(W, H, p, "density scope on", 1); }
+        { SpeakParams p = baseParams(); p.scopeHD = 1; p.scopeDensity = 1; p.strength = 0.7f; p.profile = stockProfile(); runHot(W, H, p, "both scopes on", 1); }
     } else {
         printf("  [SKIP] scope H&D / density / both    (device's OpenCL atomics are broken)\n");
     }

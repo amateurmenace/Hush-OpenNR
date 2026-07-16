@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "SpeakParams.h"
 
@@ -337,6 +338,219 @@ static inline void setDyeCoupler(SpeakProfile& p, float amount)
 }
 
 // ---------------------------------------------------------------------------
+// HALATION (Phase 4) — Speak's first spatial module.
+//
+// THE PHYSICS, AND WHY THE INJECTION POINT IS WHERE IT IS.
+// Light focused by the lens passes THROUGH the emulsion, reflects off the
+// base/air interface, and re-enters the emulsion displaced sideways. Therefore:
+//   * the SOURCE of the scattering light is the SCENE image on the emulsion;
+//   * what the scattered light ADDS TO is the negative's EXPOSURE H;
+//   * exposure is additive in linear light (photons add).
+// So H_c'(x) = H_c(x) + amount * w_c * (PSF * excess(H_c))(x), and the WHOLE
+// negative -> printer -> print cascade then sees H'. The print's shoulder is
+// what compresses the halo, which is why the halo self-limits and goes
+// white-hot in its core instead of pumping unbounded red (test/proto_halation).
+//
+// There is NO halation injection between the negative and the print. The print's
+// exposure is 10^-Dneg (chainDensity, above): it is BRIGHT where the SCENE was
+// DARK, so a highlight-driven injection there DARKENS highlight edges instead of
+// haloing them — measured, a bright disc inverts 8.056 -> 0.007. (Scatter in the
+// optical printer, and the print stock's own halation, ARE gap-sited; they are
+// real but different phenomena with the opposite polarity, and are not this
+// module.) toneChannel/chainDensity/hdCurve are therefore untouched by halation.
+//
+// WHY IT IS RED, AND WHAT THAT CLAIM IS WORTH. The light that reaches the base
+// has already been depleted of blue and green — by the yellow filter layer and
+// the upper emulsion layers — and the red-sensitive layer sits closest to the
+// base. That MECHANISM is published sensitometry. The specific {1, 0.30, 0.10}
+// ratio is NOT: it is our MODELLED DEFAULT for it, and it is stated as such in
+// the UI. (An earlier revision called these "Beer-Lambert-shaped, published AH
+// behaviour" with no citation — that fitted a made-up ratio and then cited
+// Beer-Lambert for it, and is withdrawn. Nor is this the eye's glare-spread
+// function: Vos & van den Berg / CIE 135 model corneal and lens scatter in
+// degrees of visual angle for a human observer. Citing them for base reflection
+// in an emulsion would be laundering a different physical system's authority.)
+//
+// The weight is applied PER CHANNEL to that channel's OWN scattered light.
+// Collapsing RGB to a luminous mean and tinting it red — what the prototype
+// originally did, and what the arm could not see — lets BLUE photons manufacture
+// a RED halo (measured: a (0,0,2.0) source got a red scatter 10x its blue).
+// Gated by H3/H4 in test/proto_halation.cpp.
+// ---------------------------------------------------------------------------
+static const float kHalWeight[3] = { 1.0f, 0.30f, 0.10f };
+
+// The scatter source in scene-linear light, one channel. Pure, so the pyramid
+// builder and the tests call the exact same function.
+static inline float halExcess(float lin, float thresh)
+{
+    const float l = lin < 0.0f ? 0.0f : lin;
+    return l > thresh ? (l - thresh) : 0.0f;
+}
+
+// Effective halation amount: 0 unless the optics stage is on. Callers ALSO gate
+// on the tone spine — halation re-exposes the NEGATIVE, so with no spine there
+// is no negative, and injecting scatter into linear with no curve downstream is
+// EXACTLY the end-chain overlay the control arm rejected. The UI disables the
+// controls when Film Tone is off and says why.
+static inline float halAmountOf(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? pr.profile.halAmount : 0.0f;
+}
+
+// Halation spreads a fixed distance in mm on the film, so its radius is
+// FORMAT-relative: sigma scales with frame height, never with pixel count. This
+// is what makes the look survive a proxy/full-res switch (gated: G12).
+static inline float halSigmaPx(int H, const SpeakParams& pr)
+{
+    const float s = pr.profile.halRadius * 0.01f * static_cast<float>(H);
+    return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
+}
+static inline bool halActive(const SpeakParams& pr)
+{
+    return (pr.enableTone != 0) && (pr.strength > 0.0f) && (halAmountOf(pr) > 0.0f);
+}
+
+// ---- pyramid geometry (identical arithmetic in all four backends) ----
+static inline int halLevelCount(int W, int H)
+{
+    int n = 1, w = W, h = H;
+    while (n < SPEAK_HAL_MAXLEV && w > SPEAK_HAL_MINDIM && h > SPEAK_HAL_MINDIM) {
+        w = (w + 1) / 2; h = (h + 1) / 2; n++;
+    }
+    return n;
+}
+// Dimensions and the packed arena offset (in PIXELS, x3 for RGB) of level L.
+static inline void halLevelInfo(int W, int H, int L, int& lw, int& lh, int& off)
+{
+    int w = W, h = H, o = 0;
+    for (int i = 0; i < L; ++i) { o += w * h; w = (w + 1) / 2; h = (h + 1) / 2; }
+    lw = w; lh = h; off = o;
+}
+static inline int halArenaPixels(int W, int H)
+{
+    int lw, lh, off;
+    const int n = halLevelCount(W, H);
+    halLevelInfo(W, H, n, lw, lh, off);   // offset just past the last level
+    return off;
+}
+
+// Level L's effective full-res sigma. Two terms, and BOTH are load-bearing:
+//   1. DECIMATION. The [1,3,3,1]/8 kernel has variance 0.75 in its own level's
+//      pixel units, so going from level j to j+1 adds 0.75*(2^j)^2 full-res
+//      px^2:   sum_{j<L} 0.75*4^j = 0.25*(4^L - 1).
+//   2. UPSAMPLE. Reading level L back at full res bilinearly interpolates
+//      samples 2^L px apart, and a tent filter of spacing h has variance h^2/6,
+//      adding 4^L/6. (Level 0 needs no interpolation, so it takes no such term.)
+//   var_L = 0.25*(4^L - 1) + [L>0] * 4^L/6      =>   sigma_L -> 0.6455 * 2^L
+//
+// Term 2 was missing from the first draft and the ladder came out 1.29x low at
+// EVERY level — a constant scale error, so the octave spacing still looked
+// perfect and only an absolute measurement could catch it. G13 caught it:
+// predicted 15.99 vs 20.65 measured at level 5. It is PINNED THERE against the
+// real impulse response, because a wrong ladder silently resizes the shipped
+// halo and parity would never see it.
+static const float kHalSigmaC = 0.645497f;   // sqrt(0.25 + 1/6): sigma_L / 2^L
+static inline float halLevelSigma(int L)
+{
+    const float q = std::exp2(2.0f * static_cast<float>(L));   // 4^L
+    const float up = (L > 0) ? (q * (1.0f / 6.0f)) : 0.0f;
+    return std::sqrt(0.25f * (q - 1.0f) + up);
+}
+
+// The mixture weights. Level L contributes a Gaussian of sigma_L ~ 2^(L-1); a
+// weighted sum over octaves is a MULTI-SCALE scatter — a bright core plus a wide
+// faint skirt — which a single Gaussian cannot produce at any sigma. Levels
+// tighter than the target fall off fast (kHalCoreFall); broader levels decay
+// slowly (kHalSkirtFall = 1 => weight halves per octave), which is the skirt.
+//
+// The tail this produces is a power law, by construction: at radius r the
+// dominant term is the level with sigma_L ~ r, contributing w_L/sigma_L^2 (a 2D
+// Gaussian's peak amplitude goes as 1/sigma^2). With w_L ~ 2^-d and sigma_L ~
+// 2^d that is 2^-d/4^d = 8^-d, and r ~ 2^d, so the contribution falls as r^-3 —
+// versus a Gaussian's exp(-r^2/2sigma^2). Measured against a matched-core
+// Gaussian in G14; kHalSkirtFall is a MODELLED DEFAULT, not a cited constant.
+static const float kHalCoreFall  = 3.0f;   // octaves tighter than target: fast cut
+static const float kHalSkirtFall = 1.0f;   // octaves broader: halve per octave
+static inline float halLevelWeight(int L, float sigmaTarget)
+{
+    // Target level from sigma_L -> kHalSigmaC * 2^L  =>  L_t = log2(sigma/C).
+    // Continuous in L_t, so the radius slider is smooth: it does NOT snap to
+    // octaves as the level bracket moves (gated by G16 across a 4x resolution
+    // change, which is the same machinery).
+    const float s = sigmaTarget < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : sigmaTarget;
+    const float Lt = std::log2(s / kHalSigmaC);
+    const float d = static_cast<float>(L) - Lt;
+    return (d <= 0.0f) ? std::exp2(kHalCoreFall * d) : std::exp2(-kHalSkirtFall * d);
+}
+
+// ---- pyramid taps (per-pixel, so the GPU kernels are textual ports) ----
+// Clamp-to-edge fetch. NOTE the consequence, which is stated in the UI rather
+// than hidden: a highlight AT the frame edge scatters against a clamped border,
+// so its halo carries slightly less energy than one in frame centre. There is
+// no closed form to compensate; the energy gate (G15) therefore measures the
+// INTERIOR, at least 2 sigma from every border, where the identity is exact.
+static inline float halFetch(const float* arena, int off, int lw, int lh, int x, int y, int c)
+{
+    const int xx = x < 0 ? 0 : (x >= lw ? lw - 1 : x);
+    const int yy = y < 0 ? 0 : (y >= lh ? lh - 1 : y);
+    return arena[(static_cast<size_t>(off) + static_cast<size_t>(yy) * lw + xx) * 3 + c];
+}
+
+// The [1,3,3,1]/8 separable binomial decimation. Its taps sum to 1 on each axis,
+// so it is MEAN-PRESERVING: every level carries the same total energy as level 0
+// once upsampled, which is what makes the mixture energy-normalized by Sum(w)=1
+// alone. Deterministic and atomics-free (lesson: Apple's OpenCL miscompiles
+// global int32 atomics, so no spatial pass may depend on them).
+static const float kHalDec[4] = { 0.125f, 0.375f, 0.375f, 0.125f };
+static inline void halDecimatePixel(const float* arena, int sOff, int sW, int sH,
+                                    int dx, int dy, float* out)
+{
+    for (int c = 0; c < 3; ++c) {
+        float acc = 0.0f;
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i)
+                acc += kHalDec[i] * kHalDec[j] *
+                       halFetch(arena, sOff, sW, sH, 2 * dx - 1 + i, 2 * dy - 1 + j, c);
+        out[c] = acc;
+    }
+}
+
+// Bilinear read of one level at a full-res pixel.
+static inline float halSampleLevel(const float* arena, int off, int lw, int lh,
+                                   int W, int H, int x, int y, int c)
+{
+    const float fx = (static_cast<float>(x) + 0.5f) * static_cast<float>(lw) / static_cast<float>(W) - 0.5f;
+    const float fy = (static_cast<float>(y) + 0.5f) * static_cast<float>(lh) / static_cast<float>(H) - 0.5f;
+    const int x0 = static_cast<int>(std::floor(fx)), y0 = static_cast<int>(std::floor(fy));
+    const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
+    const float a = lerpf(halFetch(arena, off, lw, lh, x0,     y0,     c),
+                          halFetch(arena, off, lw, lh, x0 + 1, y0,     c), tx);
+    const float b = lerpf(halFetch(arena, off, lw, lh, x0,     y0 + 1, c),
+                          halFetch(arena, off, lw, lh, x0 + 1, y0 + 1, c), tx);
+    return lerpf(a, b, ty);
+}
+
+// The scatter at one pixel: the energy-normalized octave mixture. This is a PURE
+// OPTICAL quantity — the AH weight and the amount are applied at the injection
+// site, NOT here, so bloom can re-read this same plane with its own weights.
+static inline void halScatterAt(const float* arena, int W, int H, int nLev,
+                                float sigmaTarget, int x, int y, float* out)
+{
+    float acc[3] = { 0.0f, 0.0f, 0.0f };
+    float wsum = 0.0f;
+    for (int L = 0; L < nLev; ++L) {
+        const float wl = halLevelWeight(L, sigmaTarget);
+        int lw, lh, off;
+        halLevelInfo(W, H, L, lw, lh, off);
+        for (int c = 0; c < 3; ++c)
+            acc[c] += wl * halSampleLevel(arena, off, lw, lh, W, H, x, y, c);
+        wsum += wl;
+    }
+    const float inv = wsum > 0.0f ? (1.0f / wsum) : 0.0f;
+    for (int c = 0; c < 3; ++c) out[c] = acc[c] * inv;
+}
+
+// ---------------------------------------------------------------------------
 // Live H&D curve scope (deterministic — a pure function of the params, so it is
 // parity-trivial). The curves are drawn by evaluating the SAME production
 // hdCurve()/chainDensity() the pixels use, so the plot can never disagree with
@@ -348,10 +562,23 @@ static inline void setDyeCoupler(SpeakProfile& p, float amount)
 // with an 18% gray crosshair and R/G/B legend swatches. Text labels and the
 // live exposure histogram land in the next increment.
 // ---------------------------------------------------------------------------
-// The LOOK in working-space linear: decode, tone spine, subtractive color.
-// Shared by the pixel path and the density scope's measurement pass, so the
-// scope measures exactly what the pixels became — it cannot drift from them.
-static inline void lookLinear(float r, float g, float b, const SpeakParams& pr,
+// The LOOK in working-space linear: decode, halation re-exposure, tone spine,
+// subtractive color. Shared by the pixel path and the density scope's
+// measurement pass, so the scope measures exactly what the pixels became — it
+// cannot drift from them.
+//
+// `scat*` are the energy-normalized, blurred, PER-CHANNEL scene-linear highlight
+// excesses at this pixel (0 when halation is off). They are deliberately NOT
+// defaulted: the density scope calls this function, and a scope that silently
+// passed 0 would measure an image the pixels never became — an L3-class bug that
+// parity CANNOT catch, because all four backends would agree on the same wrong
+// parade. Forcing every call site to pass scatter is the gate. The failure would
+// even be directional: halation raises E, so toneChannel(E) rises and density
+// falls, and a scatter-blind parade would draw the halo DARKER than it is —
+// exactly where the user opened the scope to look.
+static inline void lookLinear(float r, float g, float b,
+                              float scatR, float scatG, float scatB,
+                              const SpeakParams& pr,
                               float& oR, float& oG, float& oB)
 {
     const SpeakProfile& p = pr.profile;
@@ -362,9 +589,24 @@ static inline void lookLinear(float r, float g, float b, const SpeakParams& pr,
     float mr = lr, mg = lg, mb = lb;
     if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
         const float s = clampf(pr.strength, 0.0f, 1.0f);
-        mr = lerpf(lr, toneChannel(lr, 0, p), s);
-        mg = lerpf(lg, toneChannel(lg, 1, p), s);
-        mb = lerpf(lb, toneChannel(lb, 2, p), s);
+        const float a = halAmountOf(pr);
+        // RE-EXPOSURE: the scattered light adds to the scene light ENTERING the
+        // negative, so it goes in the CURVE'S ARGUMENT. The dry side of the mix
+        // stays lr, not the re-exposed value — otherwise strength 0 would leave
+        // the raw scatter added to linear with no curve downstream, which is
+        // precisely the end-chain overlay the arm rejected (and would break the
+        // identity gate G3). Branch rather than multiply by zero so amount 0 is
+        // provably bit-exact with the pre-halation build; `a` is frame-uniform,
+        // so the branch costs no GPU divergence.
+        float er = lr, eg = lg, eb = lb;
+        if (a > 0.0f) {
+            er = lr + a * kHalWeight[0] * scatR;
+            eg = lg + a * kHalWeight[1] * scatG;
+            eb = lb + a * kHalWeight[2] * scatB;
+        }
+        mr = lerpf(lr, toneChannel(er, 0, p), s);
+        mg = lerpf(lg, toneChannel(eg, 1, p), s);
+        mb = lerpf(lb, toneChannel(eb, 2, p), s);
     }
     if ((pr.enableDye != 0) && dyeActive(p)) subtractiveColor(mr, mg, mb, p, mr, mg, mb);
     if ((pr.enableSplit != 0) && splitActive(p)) splitTone(mr, mg, mb, p, mr, mg, mb);
@@ -403,7 +645,11 @@ static inline float pixelStops(int cs, float r, float g, float b)
     const float m = (decodeToLinear(cs, r) + decodeToLinear(cs, g) + decodeToLinear(cs, b)) * (1.0f / 3.0f);
     return std::log2((m < kLinTiny ? kLinTiny : m) / k18Gray);
 }
-inline void computeStats(const float* src, int W, int H, const SpeakParams& pr, uint32_t* stats)
+// `scat` is the W*H*3 interleaved scatter field, or null when halation is off.
+// The density parade MUST see it — see the lookLinear header for why a
+// scatter-blind scope is an L3 bug parity cannot catch.
+inline void computeStats(const float* src, const float* scat, int W, int H,
+                         const SpeakParams& pr, uint32_t* stats)
 {
     for (int i = 0; i < SPEAK_STATS_UINTS; ++i) stats[i] = 0u;
     if (pr.scopeHD == 0 && pr.scopeDensity == 0) return;   // only measured when shown
@@ -411,11 +657,14 @@ inline void computeStats(const float* src, int W, int H, const SpeakParams& pr, 
     for (int y = 0; y < H; y += 2)
         for (int x = 0; x < W; x += 2) {
             const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const size_t j = (static_cast<size_t>(y) * W + x) * 3;
             if (pr.scopeHD != 0)
                 stats[SPEAK_STATS_HIST_EXP + expBinOf(pixelStops(cs, src[i], src[i + 1], src[i + 2]))]++;
             if (pr.scopeDensity != 0) {
                 float mr, mg, mb;
-                lookLinear(src[i], src[i + 1], src[i + 2], pr, mr, mg, mb);
+                lookLinear(src[i], src[i + 1], src[i + 2],
+                           scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
+                           scat ? scat[j + 2] : 0.0f, pr, mr, mg, mb);
                 const int col = wfColOf(x, W);
                 stats[wfIdx(0, col, wfRowOf(density10(mr)))]++;
                 stats[wfIdx(1, col, wfRowOf(density10(mg)))]++;
@@ -617,6 +866,7 @@ static inline void deliverInput(const SpeakParams& pr, float r, float g, float b
 // passes through). This is the ONE function the four backends must agree on.
 // ---------------------------------------------------------------------------
 static inline void processPixel(float r, float g, float b,
+                                float scatR, float scatG, float scatB,
                                 int x, int y, int W, int H,
                                 const SpeakParams& pr, const uint32_t* stats,
                                 float& outR, float& outG, float& outB)
@@ -630,13 +880,14 @@ static inline void processPixel(float r, float g, float b,
 
     if (!toneOn && !dyeOn && !splitOn && !bake) {
         // Working space + no look: bit-exact pass-through (identity). Scopes
-        // may still overwrite below.
+        // may still overwrite below. Halation cannot reach here: halActive()
+        // requires toneOn, so this branch already excludes it.
         outR = r; outG = g; outB = b;
     } else {
-        // The look in working-space linear (tone spine + subtractive color) —
-        // the SAME function the density scope measures.
+        // The look in working-space linear (halation + tone spine + subtractive
+        // color) — the SAME function the density scope measures.
         float mr, mg, mb;
-        lookLinear(r, g, b, pr, mr, mg, mb);
+        lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
         if (bake) {
             // Output CST: gamut-convert to Rec.709 and encode gamma 2.4. Applies
             // regardless of the look (it is delivery, not a look) — a hard gamut
@@ -663,6 +914,36 @@ static inline void processPixel(float r, float g, float b,
         (pr.viewMode == SPEAK_VIEW_SPLIT && x < W / 2))
         deliverInput(pr, r, g, b, outR, outG, outB);
 
+    // Isolated-scatter view (spec 1B.5: "an isolated-scatter scope"; 1B "show
+    // halation-only"). It shows the ACTUAL injected re-exposure, a * w_c * S_c,
+    // delivered through the SAME output transform as the picture — so it is in
+    // the same units as the image and cannot overstate itself. Deliberately NOT
+    // auto-normalized or gained up: a per-frame normalisation would make a
+    // negligible halo look enormous, which is the exact dishonesty this view
+    // exists to prevent. If it reads dark, that IS the measurement — halation is
+    // a small addition everywhere except beside a real highlight.
+    if (pr.viewMode == SPEAK_VIEW_SCATTER) {
+        const float a = halAmountOf(pr);
+        const float on = ((pr.enableTone != 0) && (pr.strength > 0.0f)) ? 1.0f : 0.0f;
+        float sr = on * a * kHalWeight[0] * scatR;
+        float sg = on * a * kHalWeight[1] * scatG;
+        float sb = on * a * kHalWeight[2] * scatB;
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, sr, sg, sb, rr, rg, rb);
+            sr = rr < 0.0f ? 0.0f : rr;
+            sg = rg < 0.0f ? 0.0f : rg;
+            sb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(SPEAK_CS_REC709_G24, sr);
+            outG = encodeFromLinear(SPEAK_CS_REC709_G24, sg);
+            outB = encodeFromLinear(SPEAK_CS_REC709_G24, sb);
+        } else {
+            outR = encodeFromLinear(cs, sr);
+            outG = encodeFromLinear(cs, sg);
+            outB = encodeFromLinear(cs, sb);
+        }
+    }
+
     // Scopes render last, over any view (each owns its own corner).
     float sr, sg, sb;
     if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
@@ -673,15 +954,71 @@ static inline void processPixel(float r, float g, float b,
 // Whole-frame CPU entry point (the reference the GPU kernels are ported from).
 // Interleaved RGBA float, row-major, y up (OFX-native buffer order).
 // ---------------------------------------------------------------------------
+// Builds the scatter pyramid for a frame. `arena` must hold
+// halArenaPixels(W,H)*3 floats and `scat` W*H*3. Only called when halation is
+// live — see speakFrame.
+inline void buildHalScatter(const float* src, int W, int H, const SpeakParams& pr,
+                            float* arena, float* scat)
+{
+    const int cs = pr.inputColorSpace;
+    const float th = pr.profile.halThresh;
+    // Level 0: the per-channel scene-linear highlight excess.
+    // THRESHOLD BEFORE DECIMATION — mean(max(0, l-t)) != max(0, mean(l)-t), so
+    // thresholding a downsampled level would scatter a different field than the
+    // one the physics names (and would leak sub-threshold light into the halo).
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const size_t o = (static_cast<size_t>(y) * W + x) * 3;
+            arena[o + 0] = halExcess(decodeToLinear(cs, src[i + 0]), th);
+            arena[o + 1] = halExcess(decodeToLinear(cs, src[i + 1]), th);
+            arena[o + 2] = halExcess(decodeToLinear(cs, src[i + 2]), th);
+        }
+    const int nLev = halLevelCount(W, H);
+    for (int L = 1; L < nLev; ++L) {
+        int sw, sh, so, dw, dh, doff;
+        halLevelInfo(W, H, L - 1, sw, sh, so);
+        halLevelInfo(W, H, L,     dw, dh, doff);
+        for (int y = 0; y < dh; ++y)
+            for (int x = 0; x < dw; ++x) {
+                float v[3];
+                halDecimatePixel(arena, so, sw, sh, x, y, v);
+                const size_t o = (static_cast<size_t>(doff) + static_cast<size_t>(y) * dw + x) * 3;
+                arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+            }
+    }
+    const float sig = halSigmaPx(H, pr);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            float v[3];
+            halScatterAt(arena, W, H, nLev, sig, x, y, v);
+            const size_t o = (static_cast<size_t>(y) * W + x) * 3;
+            scat[o + 0] = v[0]; scat[o + 1] = v[1]; scat[o + 2] = v[2];
+        }
+}
+
 inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, float* dst)
 {
-    uint32_t stats[SPEAK_STATS_UINTS];
-    computeStats(src, W, H, pr, stats);           // measure the frame, then render
+    // Heap, not stack: SPEAK_STATS_UINTS is 36994 uints = ~148 KB, which is at
+    // or past the default stack limit on some hosts' worker threads.
+    std::vector<uint32_t> stats(SPEAK_STATS_UINTS, 0u);
+    std::vector<float> arena, scat;
+    const bool hal = halActive(pr) || (pr.viewMode == SPEAK_VIEW_SCATTER);
+    if (hal) {
+        arena.assign(static_cast<size_t>(halArenaPixels(W, H)) * 3, 0.0f);
+        scat.assign(static_cast<size_t>(W) * H * 3, 0.0f);
+        buildHalScatter(src, W, H, pr, arena.data(), scat.data());
+    }
+    const float* sc = hal ? scat.data() : nullptr;
+    computeStats(src, sc, W, H, pr, stats.data());   // measure the frame, then render
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const size_t j = (static_cast<size_t>(y) * W + x) * 3;
             float oR, oG, oB;
-            processPixel(src[i + 0], src[i + 1], src[i + 2], x, y, W, H, pr, stats, oR, oG, oB);
+            processPixel(src[i + 0], src[i + 1], src[i + 2],
+                         sc ? sc[j + 0] : 0.0f, sc ? sc[j + 1] : 0.0f, sc ? sc[j + 2] : 0.0f,
+                         x, y, W, H, pr, stats.data(), oR, oG, oB);
             dst[i + 0] = oR;
             dst[i + 1] = oG;
             dst[i + 2] = oB;
@@ -715,6 +1052,13 @@ static inline SpeakProfile neutralProfile()
     for (int k = 0; k < 9; ++k) p.dyeCouple[k] = 0.0f;
     p.printerMaster = 0.0f;
     p.splitPivot = 0.0f; p.splitBalance = 0.5f;
+    // Halation: OFF by default (amount 0 => bit-exact identity, and the whole
+    // multi-pass scatter chain is skipped). The radius default is a modelled
+    // characteristic scale, not a measured stock: base-reflection geometry puts
+    // the TIR onset around 2*t*tan(asin(1/n)) ~ 0.23 mm for a 0.13 mm base,
+    // ~1% of a Super-35 frame. That sets the ORDER of the default; it is not a
+    // precision claim, and the hint does not make one.
+    p.halAmount = 0.0f; p.halRadius = 1.0f; p.halThresh = 0.6f;
     p.systemGamma = 1.6f; p.residualLUT = 0; p.profileVersion = 1; p._pad0 = 0;
     return p;
 }

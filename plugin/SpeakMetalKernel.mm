@@ -25,6 +25,7 @@ typedef struct SpeakProfile
     float prnToe[3];    float prnShoulder[3]; float prnSpeed[3];
     float dyeCouple[9]; float subSat[3];    float subSatKnee[3];
     float splitShadow[3]; float splitHigh[3]; float splitPivot; float splitBalance;
+    float halAmount;    float halRadius;   float halThresh;
     float systemGamma;  int residualLUT;    int profileVersion; int _pad0;
 } SpeakProfile;
 
@@ -152,6 +153,9 @@ inline float toneChannel(float lin, int ch, constant SpeakProfile& p)
 #define SPEAK_WF_DMAX        3.0f
 #define SPEAK_STATS_WF       129
 #define SPEAK_STATS_WF_MAX   (129 + 36864)
+#define SPEAK_HAL_MAXLEV     14
+#define SPEAK_HAL_MINDIM     8
+#define SPEAK_HAL_SIGMA_MIN  0.05f
 
 inline int wfColOf(int x, int W)
 {
@@ -236,7 +240,110 @@ inline bool splitActive(constant SpeakProfile& p)
            p.splitHigh[0] != 0.0f || p.splitHigh[1] != 0.0f || p.splitHigh[2] != 0.0f;
 }
 
-inline void lookLinear(float r, float g, float b, constant SpeakParams& pr,
+// ---- HALATION (Phase 4) — see speak_core.h for the physics and the gates ----
+constant float kHalWeight[3] = { 1.0f, 0.30f, 0.10f };
+
+inline float halExcess(float lin, float thresh)
+{
+    float l = lin < 0.0f ? 0.0f : lin;
+    return l > thresh ? (l - thresh) : 0.0f;
+}
+inline float halAmountOf(constant SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? pr.profile.halAmount : 0.0f;
+}
+inline float halSigmaPx(int H, constant SpeakParams& pr)
+{
+    float s = pr.profile.halRadius * 0.01f * float(H);
+    return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
+}
+inline bool halActive(constant SpeakParams& pr)
+{
+    return (pr.enableTone != 0) && (pr.strength > 0.0f) && (halAmountOf(pr) > 0.0f);
+}
+
+// ---- pyramid geometry (identical arithmetic in all four backends) ----
+inline int halLevelCount(int W, int H)
+{
+    int n = 1, w = W, h = H;
+    while (n < SPEAK_HAL_MAXLEV && w > SPEAK_HAL_MINDIM && h > SPEAK_HAL_MINDIM) {
+        w = (w + 1) / 2; h = (h + 1) / 2; n++;
+    }
+    return n;
+}
+inline void halLevelInfo(int W, int H, int L, thread int& lw, thread int& lh, thread int& off)
+{
+    int w = W, h = H, o = 0;
+    for (int i = 0; i < L; ++i) { o += w * h; w = (w + 1) / 2; h = (h + 1) / 2; }
+    lw = w; lh = h; off = o;
+}
+
+constant float kHalSigmaC   = 0.645497f;
+constant float kHalCoreFall  = 3.0f;
+constant float kHalSkirtFall = 1.0f;
+inline float halLevelWeight(int L, float sigmaTarget)
+{
+    float s = sigmaTarget < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : sigmaTarget;
+    float Lt = log2(s / kHalSigmaC);
+    float d = float(L) - Lt;
+    return (d <= 0.0f) ? exp2(kHalCoreFall * d) : exp2(-kHalSkirtFall * d);
+}
+
+inline float halFetch(device const float* arena, int off, int lw, int lh, int x, int y, int c)
+{
+    int xx = x < 0 ? 0 : (x >= lw ? lw - 1 : x);
+    int yy = y < 0 ? 0 : (y >= lh ? lh - 1 : y);
+    return arena[(off + yy * lw + xx) * 3 + c];
+}
+
+constant float kHalDec[4] = { 0.125f, 0.375f, 0.375f, 0.125f };
+inline void halDecimatePixel(device const float* arena, int sOff, int sW, int sH,
+                             int dx, int dy, thread float* out)
+{
+    for (int c = 0; c < 3; ++c) {
+        float acc = 0.0f;
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i)
+                acc += kHalDec[i] * kHalDec[j] *
+                       halFetch(arena, sOff, sW, sH, 2 * dx - 1 + i, 2 * dy - 1 + j, c);
+        out[c] = acc;
+    }
+}
+
+inline float halSampleLevel(device const float* arena, int off, int lw, int lh,
+                            int W, int H, int x, int y, int c)
+{
+    float fx = (float(x) + 0.5f) * float(lw) / float(W) - 0.5f;
+    float fy = (float(y) + 0.5f) * float(lh) / float(H) - 0.5f;
+    int x0 = int(floor(fx)), y0 = int(floor(fy));
+    float tx = fx - float(x0), ty = fy - float(y0);
+    float a = lerpf(halFetch(arena, off, lw, lh, x0,     y0,     c),
+                    halFetch(arena, off, lw, lh, x0 + 1, y0,     c), tx);
+    float b = lerpf(halFetch(arena, off, lw, lh, x0,     y0 + 1, c),
+                    halFetch(arena, off, lw, lh, x0 + 1, y0 + 1, c), tx);
+    return lerpf(a, b, ty);
+}
+
+inline void halScatterAt(device const float* arena, int W, int H, int nLev,
+                         float sigmaTarget, int x, int y, thread float* out)
+{
+    float acc[3]; acc[0] = 0.0f; acc[1] = 0.0f; acc[2] = 0.0f;
+    float wsum = 0.0f;
+    for (int L = 0; L < nLev; ++L) {
+        float wl = halLevelWeight(L, sigmaTarget);
+        int lw, lh, off;
+        halLevelInfo(W, H, L, lw, lh, off);
+        for (int c = 0; c < 3; ++c)
+            acc[c] += wl * halSampleLevel(arena, off, lw, lh, W, H, x, y, c);
+        wsum += wl;
+    }
+    float inv = wsum > 0.0f ? (1.0f / wsum) : 0.0f;
+    for (int c = 0; c < 3; ++c) out[c] = acc[c] * inv;
+}
+
+inline void lookLinear(float r, float g, float b,
+                       float scatR, float scatG, float scatB,
+                       constant SpeakParams& pr,
                        thread float& oR, thread float& oG, thread float& oB)
 {
     int cs = pr.inputColorSpace;
@@ -246,9 +353,18 @@ inline void lookLinear(float r, float g, float b, constant SpeakParams& pr,
     float mr = lr, mg = lg, mb = lb;
     if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
         float s = clampf(pr.strength, 0.0f, 1.0f);
-        mr = lerpf(lr, toneChannel(lr, 0, pr.profile), s);
-        mg = lerpf(lg, toneChannel(lg, 1, pr.profile), s);
-        mb = lerpf(lb, toneChannel(lb, 2, pr.profile), s);
+        float a = halAmountOf(pr);
+        // RE-EXPOSURE: the scattered light goes in the CURVE'S ARGUMENT. The dry
+        // side of the mix stays lr, not the re-exposed value — see speak_core.h.
+        float er = lr, eg = lg, eb = lb;
+        if (a > 0.0f) {
+            er = lr + a * kHalWeight[0] * scatR;
+            eg = lg + a * kHalWeight[1] * scatG;
+            eb = lb + a * kHalWeight[2] * scatB;
+        }
+        mr = lerpf(lr, toneChannel(er, 0, pr.profile), s);
+        mg = lerpf(lg, toneChannel(eg, 1, pr.profile), s);
+        mb = lerpf(lb, toneChannel(eb, 2, pr.profile), s);
     }
     if ((pr.enableDye != 0) && dyeActive(pr.profile)) subtractiveColor(mr, mg, mb, pr.profile, mr, mg, mb);
     if ((pr.enableSplit != 0) && splitActive(pr.profile)) splitTone(mr, mg, mb, pr.profile, mr, mg, mb);
@@ -403,7 +519,9 @@ inline void deliverInput(constant SpeakParams& pr, float r, float g, float b,
     }
 }
 
-inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
+inline void processPixel(float r, float g, float b,
+                         float scatR, float scatG, float scatB,
+                         int x, int y, int W, int H,
                          constant SpeakParams& pr, device const uint* stats,
                          thread float& outR, thread float& outG, thread float& outB)
 {
@@ -416,7 +534,7 @@ inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
         outR = r; outG = g; outB = b;
     } else {
         float mr, mg, mb;
-        lookLinear(r, g, b, pr, mr, mg, mb);
+        lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
         if (bake) {
             float rr, rg, rb;
             gamutToRec709Lin(cs, mr, mg, mb, rr, rg, rb);
@@ -435,30 +553,128 @@ inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
     if (pr.viewMode == 2 || (pr.viewMode == 1 && x < W / 2))
         deliverInput(pr, r, g, b, outR, outG, outB);
 
+    // Isolated-scatter view: the ACTUAL injected re-exposure a * w_c * S_c,
+    // delivered through the SAME output transform as the picture. Deliberately
+    // NOT auto-normalized — see speak_core.h.
+    if (pr.viewMode == 3) {
+        float a = halAmountOf(pr);
+        float on = ((pr.enableTone != 0) && (pr.strength > 0.0f)) ? 1.0f : 0.0f;
+        float sr = on * a * kHalWeight[0] * scatR;
+        float sg = on * a * kHalWeight[1] * scatG;
+        float sb = on * a * kHalWeight[2] * scatB;
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, sr, sg, sb, rr, rg, rb);
+            sr = rr < 0.0f ? 0.0f : rr;
+            sg = rg < 0.0f ? 0.0f : rg;
+            sb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(1, sr);
+            outG = encodeFromLinear(1, sg);
+            outB = encodeFromLinear(1, sb);
+        } else {
+            outR = encodeFromLinear(cs, sr);
+            outG = encodeFromLinear(cs, sg);
+            outB = encodeFromLinear(cs, sb);
+        }
+    }
+
     float sr, sg, sb;
     if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
     if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
 }
 
+// The scatter pyramid, mirroring buildHalScatter in speak_core.h. Three passes:
+// excess (full res, level 0) -> decimate (one dispatch per level) -> scatter
+// (full res). Atomics-free by construction: box decimation is order-independent.
+
+// Level 0 of the arena: the per-channel scene-linear highlight excess.
+// THRESHOLD BEFORE DECIMATION — mean(max(0, l-t)) != max(0, mean(l)-t).
+kernel void SpeakExcessKernel(constant SpeakParams& p [[buffer(0)]],
+                              constant int& W [[buffer(1)]],
+                              constant int& H [[buffer(2)]],
+                              device const float* src [[buffer(3)]],
+                              device float* arena [[buffer(4)]],
+                              uint2 gid [[thread_position_in_grid]])
+{
+    if ((int)gid.x >= W || (int)gid.y >= H) return;
+    int x = int(gid.x), y = int(gid.y);
+    int cs = p.inputColorSpace;
+    float th = p.profile.halThresh;
+    int i = (y * W + x) * 4;
+    int o = (y * W + x) * 3;
+    arena[o + 0] = halExcess(decodeToLinear(cs, src[i + 0]), th);
+    arena[o + 1] = halExcess(decodeToLinear(cs, src[i + 1]), th);
+    arena[o + 2] = halExcess(decodeToLinear(cs, src[i + 2]), th);
+}
+
+// One octave: level L-1 -> level L. Dispatched once per level, on level L's grid.
+//
+// The source/dest geometry is passed IN rather than recomputed from L in-kernel.
+// That mirrors buildHalScatter, which likewise hoists halLevelInfo out of the
+// pixel loop, and it keeps the only writable-arena kernel free of the two
+// back-to-back halLevelInfo calls whose results a writable `arena` binding was
+// observed to disturb (levels above the threadgroup size came out reading the
+// wrong octave; the read-only debug twin of this kernel computed them
+// correctly). Host and kernel therefore agree by construction.
+struct HalLevel { int sw, sh, so, dw, dh, doff; };
+kernel void SpeakDecimateKernel(constant HalLevel& lv [[buffer(0)]],
+                                device float* arena [[buffer(1)]],
+                                uint2 gid [[thread_position_in_grid]])
+{
+    if ((int)gid.x >= lv.dw || (int)gid.y >= lv.dh) return;
+    int x = int(gid.x), y = int(gid.y);
+    float v[3];
+    halDecimatePixel(arena, lv.so, lv.sw, lv.sh, x, y, v);
+    int o = (lv.doff + y * lv.dw + x) * 3;
+    arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+}
+
+// Read the pyramid back at full res as the energy-normalized octave mixture.
+kernel void SpeakScatterKernel(constant SpeakParams& p [[buffer(0)]],
+                               constant int& W [[buffer(1)]],
+                               constant int& H [[buffer(2)]],
+                               device const float* arena [[buffer(3)]],
+                               device float* scat [[buffer(4)]],
+                               uint2 gid [[thread_position_in_grid]])
+{
+    if ((int)gid.x >= W || (int)gid.y >= H) return;
+    int x = int(gid.x), y = int(gid.y);
+    int nLev = halLevelCount(W, H);
+    float sig = halSigmaPx(H, p);
+    float v[3];
+    halScatterAt(arena, W, H, nLev, sig, x, y, v);
+    int o = (y * W + x) * 3;
+    scat[o + 0] = v[0]; scat[o + 1] = v[1]; scat[o + 2] = v[2];
+}
+
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
 // order-independent, so the counts are identical on every backend.
+//
+// `scat` is only DEREFERENCED when the host actually built it (same condition as
+// speakFrame's `hal`); when halation is skipped a small placeholder buffer is
+// bound, so the guard is load-bearing, not just a mirror of the core's null test.
 kernel void SpeakStatsKernel(constant SpeakParams& p [[buffer(0)]],
                              constant int& W [[buffer(1)]],
                              constant int& H [[buffer(2)]],
                              device const float* src [[buffer(3)]],
                              device atomic_uint* stats [[buffer(4)]],
+                             device const float* scat [[buffer(5)]],
                              uint2 gid [[thread_position_in_grid]])
 {
     int x = int(gid.x) * 2, y = int(gid.y) * 2;
     if (x >= W || y >= H) return;
     int i = (y * W + x) * 4;
+    int j = (y * W + x) * 3;
     if (p.scopeHD != 0) {
         int bin = expBinOf(pixelStops(p.inputColorSpace, src[i + 0], src[i + 1], src[i + 2]));
         atomic_fetch_add_explicit(&stats[SPEAK_STATS_HIST_EXP + bin], 1u, memory_order_relaxed);
     }
     if (p.scopeDensity != 0) {
+        bool hal = halActive(p) || (p.viewMode == 3);
+        float sR = 0.0f, sG = 0.0f, sB = 0.0f;
+        if (hal) { sR = scat[j + 0]; sG = scat[j + 1]; sB = scat[j + 2]; }
         float mr, mg, mb;
-        lookLinear(src[i + 0], src[i + 1], src[i + 2], p, mr, mg, mb);
+        lookLinear(src[i + 0], src[i + 1], src[i + 2], sR, sG, sB, p, mr, mg, mb);
         int col = wfColOf(x, W);
         atomic_fetch_add_explicit(&stats[wfIdx(0, col, wfRowOf(density10(mr)))], 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&stats[wfIdx(1, col, wfRowOf(density10(mg)))], 1u, memory_order_relaxed);
@@ -484,13 +700,18 @@ kernel void SpeakKernel(constant SpeakParams& p [[buffer(0)]],
                         device const float* src [[buffer(3)]],
                         device float* dst [[buffer(4)]],
                         device const uint* stats [[buffer(5)]],
+                        device const float* scat [[buffer(6)]],
                         uint2 gid [[thread_position_in_grid]])
 {
     if ((int)gid.x >= W || (int)gid.y >= H) return;
     int x = int(gid.x), y = int(gid.y);
     int i = (y * W + x) * 4;
+    int j = (y * W + x) * 3;
+    bool hal = halActive(p) || (p.viewMode == 3);
+    float sR = 0.0f, sG = 0.0f, sB = 0.0f;
+    if (hal) { sR = scat[j + 0]; sG = scat[j + 1]; sB = scat[j + 2]; }
     float oR, oG, oB;
-    processPixel(src[i + 0], src[i + 1], src[i + 2], x, y, W, H, p, stats, oR, oG, oB);
+    processPixel(src[i + 0], src[i + 1], src[i + 2], sR, sG, sB, x, y, W, H, p, stats, oR, oG, oB);
     dst[i + 0] = oR; dst[i + 1] = oG; dst[i + 2] = oB; dst[i + 3] = src[i + 3];
 }
 )MSL";
@@ -498,11 +719,63 @@ kernel void SpeakKernel(constant SpeakParams& p [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // Host side
 // ---------------------------------------------------------------------------
+
+// ---- halation host mirrors of speak_core.h (kept textually parallel) ----
+// Per-level geometry handed to SpeakDecimateKernel (layout must match the
+// HalLevel struct declared in the MSL source above; all fields 4 bytes).
+struct HalLevel { int sw, sh, so, dw, dh, doff; };
+
+static int halLevelCount(int W, int H)
+{
+    int n = 1, w = W, h = H;
+    while (n < SPEAK_HAL_MAXLEV && w > SPEAK_HAL_MINDIM && h > SPEAK_HAL_MINDIM) {
+        w = (w + 1) / 2; h = (h + 1) / 2; n++;
+    }
+    return n;
+}
+static void halLevelInfo(int W, int H, int L, int& lw, int& lh, int& off)
+{
+    int w = W, h = H, o = 0;
+    for (int i = 0; i < L; ++i) { o += w * h; w = (w + 1) / 2; h = (h + 1) / 2; }
+    lw = w; lh = h; off = o;
+}
+static int halArenaPixels(int W, int H)
+{
+    int lw, lh, off;
+    const int n = halLevelCount(W, H);
+    halLevelInfo(W, H, n, lw, lh, off);   // offset just past the last level
+    return off;
+}
+static float halAmountOf(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? pr.profile.halAmount : 0.0f;
+}
+static bool halActive(const SpeakParams& pr)
+{
+    return (pr.enableTone != 0) && (pr.strength > 0.0f) && (halAmountOf(pr) > 0.0f);
+}
+
 struct SpeakRes {
     id<MTLComputePipelineState> main = nil;
     id<MTLComputePipelineState> stats = nil;
     id<MTLComputePipelineState> statsMax = nil;
+    id<MTLComputePipelineState> excess = nil;
+    id<MTLComputePipelineState> decimate = nil;
+    id<MTLComputePipelineState> scatter = nil;
     id<MTLBuffer> statsBuf = nil;
+    // The scatter buffers are SIZE-DEPENDENT (unlike statsBuf, whose layout is
+    // fixed): the host hands us proxy and full-res frames through the SAME queue,
+    // so the allocated length must be tracked and grown or the first
+    // proxy->full-res switch is a buffer overrun.
+    id<MTLBuffer> arenaBuf = nil;
+    size_t arenaFloats = 0;
+    id<MTLBuffer> scatBuf = nil;
+    size_t scatFloats = 0;
+    // Bound in place of scatBuf when the whole chain is skipped, so the stats and
+    // main kernels always get a VALID binding (a null binding crashes). Its
+    // contents are never read: the kernels guard the load on the same condition
+    // the host uses to skip.
+    id<MTLBuffer> nullBuf = nil;
 };
 static std::mutex s_speakMutex;
 static std::unordered_map<void*, SpeakRes> s_speakPipe;
@@ -540,11 +813,41 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
             r.stats = [device newComputePipelineStateWithFunction:fs error:&err];
             id<MTLFunction> fm = [lib newFunctionWithName:@"SpeakStatsMaxKernel"];
             r.statsMax = [device newComputePipelineStateWithFunction:fm error:&err];
-            if (!r.main || !r.stats || !r.statsMax) { fprintf(stderr, "Speak: pipeline failed\n"); return; }
+            id<MTLFunction> fe = [lib newFunctionWithName:@"SpeakExcessKernel"];
+            r.excess = [device newComputePipelineStateWithFunction:fe error:&err];
+            id<MTLFunction> fd = [lib newFunctionWithName:@"SpeakDecimateKernel"];
+            r.decimate = [device newComputePipelineStateWithFunction:fd error:&err];
+            id<MTLFunction> fc = [lib newFunctionWithName:@"SpeakScatterKernel"];
+            r.scatter = [device newComputePipelineStateWithFunction:fc error:&err];
+            if (!r.main || !r.stats || !r.statsMax ||
+                !r.excess || !r.decimate || !r.scatter) {
+                fprintf(stderr, "Speak: pipeline failed\n"); return;
+            }
         }
         if (r.statsBuf == nil)
             r.statsBuf = [device newBufferWithLength:(SPEAK_STATS_UINTS * sizeof(uint32_t))
                                              options:MTLResourceStorageModePrivate];
+        if (r.nullBuf == nil)
+            r.nullBuf = [device newBufferWithLength:(4 * sizeof(float))
+                                            options:MTLResourceStorageModePrivate];
+        // Skip the whole scatter chain when halation is inactive (mirrors
+        // speakFrame's `hal`): the identity path stays bit-exact AND free.
+        const bool wantHalAlloc = halActive(p_Params) || (p_Params.viewMode == SPEAK_VIEW_SCATTER);
+        if (wantHalAlloc) {
+            const size_t needArena = static_cast<size_t>(halArenaPixels(p_Width, p_Height)) * 3;
+            const size_t needScat = static_cast<size_t>(p_Width) * p_Height * 3;
+            if (r.arenaBuf == nil || r.arenaFloats < needArena) {
+                r.arenaBuf = [device newBufferWithLength:(needArena * sizeof(float))
+                                                 options:MTLResourceStorageModePrivate];
+                r.arenaFloats = needArena;
+            }
+            if (r.scatBuf == nil || r.scatFloats < needScat) {
+                r.scatBuf = [device newBufferWithLength:(needScat * sizeof(float))
+                                                options:MTLResourceStorageModePrivate];
+                r.scatFloats = needScat;
+            }
+            if (!r.arenaBuf || !r.scatBuf) { fprintf(stderr, "Speak: scatter alloc failed\n"); return; }
+        }
         res = r;
     }
 
@@ -566,6 +869,47 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
 
     id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
     const MTLSize tg = MTLSizeMake(16, 16, 1);
+
+    // The scatter pyramid must exist BEFORE the stats pass — the density parade
+    // measures the HALATED result (a scatter-blind scope is a bug parity cannot
+    // catch, because all four backends would agree on the same wrong parade).
+    const bool wantHal = halActive(params) || (params.viewMode == SPEAK_VIEW_SCATTER);
+    id<MTLBuffer> scatBind = wantHal ? res.scatBuf : res.nullBuf;
+    if (wantHal) {
+        const MTLSize full = MTLSizeMake((p_Width + 15) / 16, (p_Height + 15) / 16, 1);
+        [enc setComputePipelineState:res.excess];
+        [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
+        [enc setBytes:&W length:sizeof(int) atIndex:1];
+        [enc setBytes:&H length:sizeof(int) atIndex:2];
+        [enc setBuffer:src offset:0 atIndex:3];
+        [enc setBuffer:res.arenaBuf offset:0 atIndex:4];
+        [enc dispatchThreadgroups:full threadsPerThreadgroup:tg];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        const int nLev = halLevelCount(W, H);
+        for (int L = 1; L < nLev; ++L) {
+            HalLevel lv;
+            halLevelInfo(W, H, L - 1, lv.sw, lv.sh, lv.so);
+            halLevelInfo(W, H, L,     lv.dw, lv.dh, lv.doff);
+            [enc setComputePipelineState:res.decimate];
+            [enc setBytes:&lv length:sizeof(HalLevel) atIndex:0];
+            [enc setBuffer:res.arenaBuf offset:0 atIndex:1];
+            // the grid is THIS level's dims
+            [enc dispatchThreadgroups:MTLSizeMake((lv.dw + 15) / 16, (lv.dh + 15) / 16, 1)
+                threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];   // level L-1 -> L
+        }
+
+        [enc setComputePipelineState:res.scatter];
+        [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
+        [enc setBytes:&W length:sizeof(int) atIndex:1];
+        [enc setBytes:&H length:sizeof(int) atIndex:2];
+        [enc setBuffer:res.arenaBuf offset:0 atIndex:3];
+        [enc setBuffer:res.scatBuf offset:0 atIndex:4];
+        [enc dispatchThreadgroups:full threadsPerThreadgroup:tg];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+
     if (wantStats) {
         [enc setComputePipelineState:res.stats];
         [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
@@ -573,6 +917,7 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
         [enc setBytes:&H length:sizeof(int) atIndex:2];
         [enc setBuffer:src offset:0 atIndex:3];
         [enc setBuffer:res.statsBuf offset:0 atIndex:4];
+        [enc setBuffer:scatBind offset:0 atIndex:5];
         const MTLSize gh = MTLSizeMake((p_Width / 2 + 16) / 16, (p_Height / 2 + 16) / 16, 1);
         [enc dispatchThreadgroups:gh threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -590,6 +935,7 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
     [enc setBuffer:src offset:0 atIndex:3];
     [enc setBuffer:dst offset:0 atIndex:4];
     [enc setBuffer:res.statsBuf offset:0 atIndex:5];
+    [enc setBuffer:scatBind offset:0 atIndex:6];
     const MTLSize grid = MTLSizeMake((p_Width + 15) / 16, (p_Height + 15) / 16, 1);
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
     [enc endEncoding];

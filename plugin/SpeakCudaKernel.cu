@@ -210,7 +210,139 @@ __device__ inline bool splitActive(const SpeakProfile& p)
            p.splitHigh[0] != 0.0f || p.splitHigh[1] != 0.0f || p.splitHigh[2] != 0.0f;
 }
 
-__device__ inline void lookLinear(float r, float g, float b, const SpeakParams& pr,
+// ---------------------------------------------------------------------------
+// HALATION (Phase 4) — port of speak_core.h's halation block. See that file for
+// the physics and for why the injection point is the NEGATIVE'S EXPOSURE and not
+// the negative->print gap. Atomics-free by construction (box decimation is
+// order-independent) — the pyramid must never depend on them.
+//
+// Functions the HOST also needs (buffer sizing + per-level dispatch geometry)
+// are __host__ __device__; the rest stay __device__.
+// ---------------------------------------------------------------------------
+#define kHalSigmaC   0.645497f   // sqrt(0.25 + 1/6): sigma_L / 2^L
+#define kHalCoreFall 3.0f        // octaves tighter than target: fast cut
+#define kHalSkirtFall 1.0f       // octaves broader: halve per octave
+
+__device__ const float kHalWeight[3] = { 1.0f, 0.30f, 0.10f };
+__device__ const float kHalDec[4] = { 0.125f, 0.375f, 0.375f, 0.125f };
+
+__device__ inline float halExcess(float lin, float thresh)
+{
+    float l = lin < 0.0f ? 0.0f : lin;
+    return l > thresh ? (l - thresh) : 0.0f;
+}
+__host__ __device__ inline float halAmountOf(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? pr.profile.halAmount : 0.0f;
+}
+__device__ inline float halSigmaPx(int H, const SpeakParams& pr)
+{
+    float s = pr.profile.halRadius * 0.01f * (float)H;
+    return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
+}
+__host__ __device__ inline bool halActive(const SpeakParams& pr)
+{
+    return (pr.enableTone != 0) && (pr.strength > 0.0f) && (halAmountOf(pr) > 0.0f);
+}
+
+// ---- pyramid geometry (identical arithmetic in all four backends) ----
+__host__ __device__ inline int halLevelCount(int W, int H)
+{
+    int n = 1, w = W, h = H;
+    while (n < SPEAK_HAL_MAXLEV && w > SPEAK_HAL_MINDIM && h > SPEAK_HAL_MINDIM) {
+        w = (w + 1) / 2; h = (h + 1) / 2; n++;
+    }
+    return n;
+}
+__host__ __device__ inline void halLevelInfo(int W, int H, int L, int& lw, int& lh, int& off)
+{
+    int w = W, h = H, o = 0;
+    for (int i = 0; i < L; ++i) { o += w * h; w = (w + 1) / 2; h = (h + 1) / 2; }
+    lw = w; lh = h; off = o;
+}
+__host__ __device__ inline int halArenaPixels(int W, int H)
+{
+    int lw, lh, off;
+    int n = halLevelCount(W, H);
+    halLevelInfo(W, H, n, lw, lh, off);
+    return off;
+}
+
+// Level L's effective full-res sigma (decimation + upsample terms — see the
+// core). Used by the host/tests only; kept here for textual parallelism.
+__device__ inline float halLevelSigma(int L)
+{
+    float q = exp2f(2.0f * (float)L);
+    float up = (L > 0) ? (q * (1.0f / 6.0f)) : 0.0f;
+    return sqrtf(0.25f * (q - 1.0f) + up);
+}
+
+__device__ inline float halLevelWeight(int L, float sigmaTarget)
+{
+    float s = sigmaTarget < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : sigmaTarget;
+    float Lt = log2f(s / kHalSigmaC);
+    float d = (float)L - Lt;
+    return (d <= 0.0f) ? exp2f(kHalCoreFall * d) : exp2f(-kHalSkirtFall * d);
+}
+
+// ---- pyramid taps ----
+__device__ inline float halFetch(const float* arena, int off, int lw, int lh, int x, int y, int c)
+{
+    int xx = x < 0 ? 0 : (x >= lw ? lw - 1 : x);
+    int yy = y < 0 ? 0 : (y >= lh ? lh - 1 : y);
+    return arena[((size_t)off + (size_t)yy * lw + xx) * 3 + c];
+}
+
+__device__ inline void halDecimatePixel(const float* arena, int sOff, int sW, int sH,
+                                        int dx, int dy, float* out)
+{
+    for (int c = 0; c < 3; ++c) {
+        float acc = 0.0f;
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i)
+                acc += kHalDec[i] * kHalDec[j] *
+                       halFetch(arena, sOff, sW, sH, 2 * dx - 1 + i, 2 * dy - 1 + j, c);
+        out[c] = acc;
+    }
+}
+
+__device__ inline float halSampleLevel(const float* arena, int off, int lw, int lh,
+                                       int W, int H, int x, int y, int c)
+{
+    float fx = ((float)x + 0.5f) * (float)lw / (float)W - 0.5f;
+    float fy = ((float)y + 0.5f) * (float)lh / (float)H - 0.5f;
+    int x0 = (int)floorf(fx), y0 = (int)floorf(fy);   // floorf: fx/fy go negative at the edge
+    float tx = fx - (float)x0, ty = fy - (float)y0;
+    float a = lerpf(halFetch(arena, off, lw, lh, x0,     y0,     c),
+                    halFetch(arena, off, lw, lh, x0 + 1, y0,     c), tx);
+    float b = lerpf(halFetch(arena, off, lw, lh, x0,     y0 + 1, c),
+                    halFetch(arena, off, lw, lh, x0 + 1, y0 + 1, c), tx);
+    return lerpf(a, b, ty);
+}
+
+__device__ inline void halScatterAt(const float* arena, int W, int H, int nLev,
+                                    float sigmaTarget, int x, int y, float* out)
+{
+    float acc[3]; acc[0] = 0.0f; acc[1] = 0.0f; acc[2] = 0.0f;
+    float wsum = 0.0f;
+    for (int L = 0; L < nLev; ++L) {
+        float wl = halLevelWeight(L, sigmaTarget);
+        int lw, lh, off;
+        halLevelInfo(W, H, L, lw, lh, off);
+        for (int c = 0; c < 3; ++c)
+            acc[c] += wl * halSampleLevel(arena, off, lw, lh, W, H, x, y, c);
+        wsum += wl;
+    }
+    float inv = wsum > 0.0f ? (1.0f / wsum) : 0.0f;
+    for (int c = 0; c < 3; ++c) out[c] = acc[c] * inv;
+}
+
+// `scat*` are the energy-normalized, blurred, PER-CHANNEL scene-linear highlight
+// excesses at this pixel (0 when halation is off). Deliberately NOT defaulted —
+// see the core: a scatter-blind density parade is an L3 bug parity CANNOT catch.
+__device__ inline void lookLinear(float r, float g, float b,
+                                  float scatR, float scatG, float scatB,
+                                  const SpeakParams& pr,
                                   float& oR, float& oG, float& oB)
 {
     int cs = pr.inputColorSpace;
@@ -220,9 +352,19 @@ __device__ inline void lookLinear(float r, float g, float b, const SpeakParams& 
     float mr = lr, mg = lg, mb = lb;
     if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
         float s = clampf(pr.strength, 0.0f, 1.0f);
-        mr = lerpf(lr, toneChannel(lr, 0, pr.profile), s);
-        mg = lerpf(lg, toneChannel(lg, 1, pr.profile), s);
-        mb = lerpf(lb, toneChannel(lb, 2, pr.profile), s);
+        float a = halAmountOf(pr);
+        // RE-EXPOSURE: the scattered light adds to the scene light ENTERING the
+        // negative, so it goes in the CURVE'S ARGUMENT. The dry side of the mix
+        // stays lr, NOT the re-exposed value — see the core.
+        float er = lr, eg = lg, eb = lb;
+        if (a > 0.0f) {
+            er = lr + a * kHalWeight[0] * scatR;
+            eg = lg + a * kHalWeight[1] * scatG;
+            eb = lb + a * kHalWeight[2] * scatB;
+        }
+        mr = lerpf(lr, toneChannel(er, 0, pr.profile), s);
+        mg = lerpf(lg, toneChannel(eg, 1, pr.profile), s);
+        mb = lerpf(lb, toneChannel(eb, 2, pr.profile), s);
     }
     if ((pr.enableDye != 0) && dyeActive(pr.profile)) subtractiveColor(mr, mg, mb, pr.profile, mr, mg, mb);
     if ((pr.enableSplit != 0) && splitActive(pr.profile)) splitTone(mr, mg, mb, pr.profile, mr, mg, mb);
@@ -377,7 +519,9 @@ __device__ inline void deliverInput(const SpeakParams& pr, float r, float g, flo
     }
 }
 
-__device__ inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
+__device__ inline void processPixel(float r, float g, float b,
+                                    float scatR, float scatG, float scatB,
+                                    int x, int y, int W, int H,
                                     const SpeakParams& pr, const unsigned int* stats,
                                     float& outR, float& outG, float& outB)
 {
@@ -387,10 +531,11 @@ __device__ inline void processPixel(float r, float g, float b, int x, int y, int
     bool splitOn = (pr.enableSplit != 0) && splitActive(pr.profile);
     bool bake = (pr.outputMode == 1);
     if (!toneOn && !dyeOn && !splitOn && !bake) {
+        // Halation cannot reach here: halActive() requires toneOn.
         outR = r; outG = g; outB = b;
     } else {
         float mr, mg, mb;
-        lookLinear(r, g, b, pr, mr, mg, mb);
+        lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
         if (bake) {
             float rr, rg, rb;
             gamutToRec709Lin(cs, mr, mg, mb, rr, rg, rb);
@@ -409,27 +554,114 @@ __device__ inline void processPixel(float r, float g, float b, int x, int y, int
     if (pr.viewMode == 2 || (pr.viewMode == 1 && x < W / 2))
         deliverInput(pr, r, g, b, outR, outG, outB);
 
+    // Isolated-scatter view: the ACTUAL injected re-exposure a * w_c * S_c,
+    // delivered through the SAME output transform as the picture. Deliberately
+    // NOT auto-normalized — see the core.
+    if (pr.viewMode == SPEAK_VIEW_SCATTER) {
+        float a = halAmountOf(pr);
+        float on = ((pr.enableTone != 0) && (pr.strength > 0.0f)) ? 1.0f : 0.0f;
+        float sr = on * a * kHalWeight[0] * scatR;
+        float sg = on * a * kHalWeight[1] * scatG;
+        float sb = on * a * kHalWeight[2] * scatB;
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, sr, sg, sb, rr, rg, rb);
+            sr = rr < 0.0f ? 0.0f : rr;
+            sg = rg < 0.0f ? 0.0f : rg;
+            sb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(1, sr);
+            outG = encodeFromLinear(1, sg);
+            outB = encodeFromLinear(1, sb);
+        } else {
+            outR = encodeFromLinear(cs, sr);
+            outG = encodeFromLinear(cs, sg);
+            outB = encodeFromLinear(cs, sb);
+        }
+    }
+
     float sr, sg, sb;
     if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
     if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
 }
 
+// ---------------------------------------------------------------------------
+// The scatter pyramid — a textual port of speak_core.h's buildHalScatter, split
+// across three dispatches because a GPU cannot carry the level barriers inside
+// one kernel. All three run on the SAME stream as the stats/main kernels, and
+// STREAM ORDER IS THE BARRIER: each launch completes before the next begins, so
+// the level-L decimation always reads a finished level L-1 and the stats pass
+// always reads a finished scatter plane. No explicit sync, and no atomics
+// anywhere in this chain (box decimation is order-independent).
+// ---------------------------------------------------------------------------
+
+// Level 0 of the arena: the per-channel scene-linear highlight excess.
+// THRESHOLD BEFORE DECIMATION — mean(max(0, l-t)) != max(0, mean(l)-t).
+__global__ void SpeakExcessKernel(SpeakParams p, int W, int H,
+                                  const float4* src, float* arena)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    int cs = p.inputColorSpace;
+    float th = p.profile.halThresh;
+    float4 s = src[y * W + x];
+    size_t o = ((size_t)y * W + x) * 3;   // level 0's arena offset is 0
+    arena[o + 0] = halExcess(decodeToLinear(cs, s.x), th);
+    arena[o + 1] = halExcess(decodeToLinear(cs, s.y), th);
+    arena[o + 2] = halExcess(decodeToLinear(cs, s.z), th);
+}
+
+// One dispatch PER LEVEL L = 1..nLev-1: [1,3,3,1]/8 decimation of level L-1 into
+// level L. The read and write regions are disjoint slices of the same arena.
+__global__ void SpeakDecimateKernel(int W, int H, int L, float* arena)
+{
+    int sw, sh, so, dw, dh, doff;
+    halLevelInfo(W, H, L - 1, sw, sh, so);
+    halLevelInfo(W, H, L,     dw, dh, doff);
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    float v[3];
+    halDecimatePixel(arena, so, sw, sh, x, y, v);
+    size_t o = ((size_t)doff + (size_t)y * dw + x) * 3;
+    arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+}
+
+// Full res: the energy-normalized octave mixture at every pixel.
+__global__ void SpeakScatterKernel(SpeakParams p, int W, int H, int nLev,
+                                   const float* arena, float* scat)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    float sig = halSigmaPx(H, p);
+    float v[3];
+    halScatterAt(arena, W, H, nLev, sig, x, y, v);
+    size_t o = ((size_t)y * W + x) * 3;
+    scat[o + 0] = v[0]; scat[o + 1] = v[1]; scat[o + 2] = v[2];
+}
+
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
 // order-independent, so the counts are identical on every backend.
+// `scat` is the W*H*3 scatter field, or null when halation is off — the density
+// parade MUST see it, or it draws the halo darker than the pixels became.
 __global__ void SpeakStatsKernel(SpeakParams p, int W, int H,
-                                 const float4* src, unsigned int* stats)
+                                 const float4* src, const float* scat, unsigned int* stats)
 {
     int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
     if (x >= W || y >= H) return;
     float4 s = src[y * W + x];
+    size_t j = ((size_t)y * W + x) * 3;
     if (p.scopeHD != 0) {
         int bin = expBinOf(pixelStops(p.inputColorSpace, s.x, s.y, s.z));
         atomicAdd(&stats[SPEAK_STATS_HIST_EXP + bin], 1u);
     }
     if (p.scopeDensity != 0) {
         float mr, mg, mb;
-        lookLinear(s.x, s.y, s.z, p, mr, mg, mb);
+        lookLinear(s.x, s.y, s.z,
+                   scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
+                   scat ? scat[j + 2] : 0.0f, p, mr, mg, mb);
         int col = wfColOf(x, W);
         atomicAdd(&stats[wfIdx(0, col, wfRowOf(density10(mr)))], 1u);
         atomicAdd(&stats[wfIdx(1, col, wfRowOf(density10(mg)))], 1u);
@@ -450,20 +682,59 @@ __global__ void SpeakStatsMaxKernel(unsigned int* stats)
 }
 
 __global__ void SpeakKernel(SpeakParams p, int W, int H,
-                            const float4* src, float4* dst, const unsigned int* stats)
+                            const float4* src, const float* scat, float4* dst,
+                            const unsigned int* stats)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
     int i = y * W + x;
+    size_t j = ((size_t)y * W + x) * 3;
     float4 s = src[i];
     float oR, oG, oB;
-    processPixel(s.x, s.y, s.z, x, y, W, H, p, stats, oR, oG, oB);
+    processPixel(s.x, s.y, s.z,
+                 scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
+                 scat ? scat[j + 2] : 0.0f,
+                 x, y, W, H, p, stats, oR, oG, oB);
     float4 o; o.x = oR; o.y = oG; o.z = oB; o.w = s.w;
     dst[i] = o;
 }
 
-struct SpeakCudaRes { unsigned int* stats = nullptr; };
+// Host side ------------------------------------------------------------------
+// The per-stream resource cache is shared mutable state: Resolve can render on
+// several streams concurrently, and std::map insertion is not thread-safe, so
+// every touch of s_res is under this lock (same class, same style as Hush's
+// CudaKernel.cu).
+class Locker
+{
+public:
+#ifdef _WIN64
+    Locker() { InitializeCriticalSection(&m); }
+    ~Locker() { DeleteCriticalSection(&m); }
+    void Lock() { EnterCriticalSection(&m); }
+    void Unlock() { LeaveCriticalSection(&m); }
+    CRITICAL_SECTION m;
+#else
+    Locker() { pthread_mutex_init(&m, NULL); }
+    ~Locker() { pthread_mutex_destroy(&m); }
+    void Lock() { pthread_mutex_lock(&m); }
+    void Unlock() { pthread_mutex_unlock(&m); }
+    pthread_mutex_t m;
+#endif
+};
+
+struct SpeakCudaRes
+{
+    unsigned int* stats = nullptr;   // fixed size — allocated once
+    // The scatter buffers are SIZE-DEPENDENT, unlike stats: the host hands us a
+    // different frame size for proxy vs full res (and for every clip), so the
+    // allocated size is stored alongside the pointer and the pair is rebuilt
+    // whenever it changes. Getting this wrong is a buffer overrun on the first
+    // proxy->full-res switch. Lazy: a render with halation off never allocates.
+    float* arena = nullptr;          // halArenaPixels(W,H) * 3 floats
+    float* scat = nullptr;           // W * H * 3 floats
+    int halW = 0, halH = 0;          // frame size arena/scat were allocated for
+};
 
 } // namespace
 
@@ -472,24 +743,73 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
 {
     cudaStream_t stream = static_cast<cudaStream_t>(p_Stream);
 
-    // One stats buffer per stream, allocated lazily (mirrors Hush's per-stream
-    // resource cache).
+    // Mirrors speakFrame: build the scatter only when halation is live, so the
+    // identity path stays bit-exact AND free (no allocation, no dispatches).
+    const bool hal = halActive(p_Params) || (p_Params.viewMode == SPEAK_VIEW_SCATTER);
+    const int nLev = hal ? halLevelCount(p_Width, p_Height) : 0;
+    const int arenaPix = hal ? halArenaPixels(p_Width, p_Height) : 0;
+
+    // One resource set per stream, allocated lazily (mirrors Hush's per-stream
+    // resource cache, lock included).
     static std::map<void*, SpeakCudaRes> s_res;
-    SpeakCudaRes& r = s_res[p_Stream];
-    if (!r.stats)
-        cudaMalloc(&r.stats, SPEAK_STATS_UINTS * sizeof(unsigned int));
+    static Locker s_locker;
+
+    SpeakCudaRes res;
+    s_locker.Lock();
+    {
+        SpeakCudaRes& r = s_res[p_Stream];
+        if (!r.stats)
+            cudaMalloc(&r.stats, SPEAK_STATS_UINTS * sizeof(unsigned int));
+        // Re-allocate the scatter pair whenever the frame size changes — the
+        // size check lives here (not at first use) because a size change while
+        // halation was off must still be caught the next time it comes on.
+        if (hal && (!r.arena || !r.scat || r.halW != p_Width || r.halH != p_Height)) {
+            if (r.arena) { cudaFree(r.arena); r.arena = nullptr; }
+            if (r.scat)  { cudaFree(r.scat);  r.scat  = nullptr; }
+            cudaMalloc(&r.arena, static_cast<size_t>(arenaPix) * 3 * sizeof(float));
+            cudaMalloc(&r.scat, static_cast<size_t>(p_Width) * p_Height * 3 * sizeof(float));
+            r.halW = p_Width;
+            r.halH = p_Height;
+        }
+        res = r;
+    }
+    s_locker.Unlock();
+
+    // Null when halation is off, exactly as speakFrame passes nullptr — the
+    // kernels guard the read the same way computeStats/processPixel do. (CUDA
+    // takes a null pointer argument happily; it is simply never dereferenced.)
+    const float* sc = hal ? res.scat : nullptr;
 
     dim3 block(16, 16, 1);
-    cudaMemsetAsync(r.stats, 0, SPEAK_STATS_UINTS * sizeof(unsigned int), stream);
+    dim3 grid((p_Width + block.x - 1) / block.x, (p_Height + block.y - 1) / block.y, 1);
+
+    // Dispatch order: excess -> decimate(L=1..nLev-1) -> scatter -> stats -> main.
+    // The scatter must exist BEFORE stats, because the density parade measures
+    // the halated result. Stream ordering supplies every barrier.
+    if (hal) {
+        SpeakExcessKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height,
+                                                      reinterpret_cast<const float4*>(p_Src),
+                                                      res.arena);
+        for (int L = 1; L < nLev; ++L) {
+            int lw, lh, off;
+            halLevelInfo(p_Width, p_Height, L, lw, lh, off);
+            dim3 gridL((lw + block.x - 1) / block.x, (lh + block.y - 1) / block.y, 1);
+            SpeakDecimateKernel<<<gridL, block, 0, stream>>>(p_Width, p_Height, L, res.arena);
+        }
+        SpeakScatterKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height, nLev,
+                                                       res.arena, res.scat);
+    }
+
+    cudaMemsetAsync(res.stats, 0, SPEAK_STATS_UINTS * sizeof(unsigned int), stream);
     if (p_Params.scopeHD != 0 || p_Params.scopeDensity != 0) {
         dim3 gridH((p_Width / 2 + block.x - 1) / block.x, (p_Height / 2 + block.y - 1) / block.y, 1);
         SpeakStatsKernel<<<gridH, block, 0, stream>>>(p_Params, p_Width, p_Height,
-                                                      reinterpret_cast<const float4*>(p_Src), r.stats);
-        SpeakStatsMaxKernel<<<1, 1, 0, stream>>>(r.stats);
+                                                      reinterpret_cast<const float4*>(p_Src),
+                                                      sc, res.stats);
+        SpeakStatsMaxKernel<<<1, 1, 0, stream>>>(res.stats);
     }
 
-    dim3 grid((p_Width + block.x - 1) / block.x, (p_Height + block.y - 1) / block.y, 1);
     SpeakKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height,
-                                            reinterpret_cast<const float4*>(p_Src),
-                                            reinterpret_cast<float4*>(p_Dst), r.stats);
+                                            reinterpret_cast<const float4*>(p_Src), sc,
+                                            reinterpret_cast<float4*>(p_Dst), res.stats);
 }

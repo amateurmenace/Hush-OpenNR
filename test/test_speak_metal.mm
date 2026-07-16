@@ -62,11 +62,35 @@ static SpeakProfile stockProfile()
     return p;
 }
 
-static void run(id<MTLDevice> device, id<MTLCommandQueue> queue,
-                int W, int H, const SpeakParams& p, const char* label,
-                int mode) // 0 strict, 1 hud-tolerant (scope)
+// A frame with a REAL HIGHLIGHT: a hot, slightly-warm disc on a dim blue-ish
+// field, plus a saturated blue lamp. A smooth gradient (makeFrame) barely
+// exercises a scatter pyramid — nothing has a sharp enough highlight edge to
+// reveal a wrong octave, and no source is saturated enough to reveal a
+// per-channel scatter error. This is the frame the halation cases use.
+static std::vector<float> makeHotFrame(int W, int H)
 {
-    std::vector<float> src = makeFrame(W, H);
+    std::vector<float> f(static_cast<size_t>(W) * H * 4);
+    const float cx = W * 0.42f, cy = H * 0.45f, rad = W * 0.09f;
+    const float bx = W * 0.75f, by = H * 0.70f, brad = W * 0.05f;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const float d = std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+            const float db = std::sqrt((x - bx) * (x - bx) + (y - by) * (y - by));
+            if (d <= rad)        { f[i + 0] = 9.0f;  f[i + 1] = 8.2f;  f[i + 2] = 7.0f; }
+            else if (db <= brad) { f[i + 0] = 0.02f; f[i + 1] = 0.05f; f[i + 2] = 6.0f; } // blue lamp
+            else                 { f[i + 0] = 0.05f + 0.20f * (static_cast<float>(x) / (W - 1));
+                                   f[i + 1] = 0.07f;
+                                   f[i + 2] = 0.12f + 0.10f * (static_cast<float>(y) / (H - 1)); }
+            f[i + 3] = 1.0f;
+        }
+    return f;
+}
+
+static void runSrc(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                   int W, int H, const SpeakParams& p, const char* label,
+                   int mode, const std::vector<float>& src)
+{
     const size_t n = static_cast<size_t>(W) * H * 4;
     const size_t bytes = n * sizeof(float);
 
@@ -100,6 +124,28 @@ static void run(id<MTLDevice> device, id<MTLCommandQueue> queue,
     printf("  [%s] %-30s max %.2e  mean %.2e  over %zu\n",
            pass ? "PASS" : "FAIL", label, maxd, meand, nOver);
     if (!pass) g_fail++;
+}
+
+static void run(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                int W, int H, const SpeakParams& p, const char* label,
+                int mode) // 0 strict, 1 hud-tolerant (scope)
+{
+    runSrc(device, queue, W, H, p, label, mode, makeFrame(W, H));
+}
+static void runHot(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                   int W, int H, const SpeakParams& p, const char* label, int mode)
+{
+    runSrc(device, queue, W, H, p, label, mode, makeHotFrame(W, H));
+}
+static SpeakParams halParams(float amount, float radius)
+{
+    SpeakParams p = baseParams();
+    p.inputColorSpace = SPEAK_CS_LINEAR;   // scene-linear in, so the disc is a real highlight
+    p.enableOptics = 1;
+    p.profile.halAmount = amount;
+    p.profile.halRadius = radius;
+    p.profile.halThresh = 0.6f;
+    return p;
 }
 
 int main()
@@ -164,6 +210,54 @@ int main()
     // 6 — H&D scope on (hud-tolerant).
     { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile();
       run(device, queue, W, H, p, "scope H&D on s0.6", 1); }
+
+    // ------------------------------------------------------------ 7 halation
+    // The scatter pyramid is multi-pass and size-dependent, so it needs its own
+    // coverage: BEFORE these cases existed the suite reported PARITY GREEN on a
+    // completely broken pyramid, because no case ever set halAmount.
+    printf("  -- halation (the scatter pyramid) --\n");
+    // 7a — halation off but optics on: must still be bit-exact (skip path).
+    { SpeakParams p = halParams(0.0f, 1.0f);
+      runHot(device, queue, W, H, p, "halation amount 0 (skip path)", 0); }
+    // 7b — halation standalone on a real highlight.
+    { SpeakParams p = halParams(1.0f, 1.0f);
+      runHot(device, queue, W, H, p, "halation s1.0 r1.0%", 0); }
+    // 7c — a WIDE radius: drives the mixture up into the small top levels, whose
+    // dimensions fall below one threadgroup. That is exactly where a wrong grid
+    // or a wrong level ladder hides.
+    { SpeakParams p = halParams(1.2f, 6.0f);
+      runHot(device, queue, W, H, p, "halation wide r6.0%", 0); }
+    // 7d — a TIGHT radius (the mixture sits on the bottom levels).
+    { SpeakParams p = halParams(1.0f, 0.1f);
+      runHot(device, queue, W, H, p, "halation tight r0.1%", 0); }
+    // 7e — the isolated-scatter view.
+    { SpeakParams p = halParams(1.0f, 2.0f); p.viewMode = SPEAK_VIEW_SCATTER;
+      runHot(device, queue, W, H, p, "halation scatter view", 0); }
+    // 7f — halation through the whole look (dye + split + stock) and baked.
+    { SpeakParams p = halParams(0.9f, 1.5f); p.profile = stockProfile();
+      p.profile.halAmount = 0.9f; p.profile.halRadius = 1.5f; p.profile.halThresh = 0.6f;
+      p.enableDye = 1; p.enableSplit = 1;
+      p.profile.subSat[0] = p.profile.subSat[1] = p.profile.subSat[2] = 0.6f;
+      speakcore::setDyeCoupler(p.profile, 0.8f);
+      p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
+      p.profile.splitShadow[2] = -0.09f; p.profile.splitHigh[0] = -0.07f;
+      runHot(device, queue, W, H, p, "halation + full stack", 0); }
+    // 7g — halation + the density parade: the parade must measure the HALATED
+    // result, so this case is what proves the scatter reaches the stats pass.
+    { SpeakParams p = halParams(1.0f, 2.0f); p.scopeDensity = 1;
+      runHot(device, queue, W, H, p, "halation + density scope", 1); }
+    // 7h — ODD dimensions: every level's dims go odd, exercising the (w+1)/2
+    // ladder and the clamped decimation taps.
+    { SpeakParams p = halParams(1.0f, 2.0f);
+      runHot(device, queue, 333, 197, p, "halation odd dims 333x197", 0); }
+    // 7i — SIZE CHANGES on ONE queue: proxy -> full -> proxy -> bigger. The
+    // scatter buffers are size-dependent (the stats buffer is not), so this is
+    // the realloc path — and a stale buffer here is a silent overrun.
+    { SpeakParams p = halParams(1.0f, 2.0f);
+      runHot(device, queue, 320, 240,  p, "halation size 320x240", 0);
+      runHot(device, queue, 1280, 720, p, "halation size 1280x720", 0);
+      runHot(device, queue, 320, 240,  p, "halation size back to 320x240", 0);
+      runHot(device, queue, 960, 540,  p, "halation size 960x540", 0); }
 
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);
     return g_fail ? 1 : 0;

@@ -86,16 +86,15 @@ static void blurSep(const std::vector<float>& in, int W, int H, float sigma, std
         }
 }
 
-// The light that reaches the film base has already passed the yellow filter layer
-// and the upper (blue/green) emulsion layers, and the red-sensitive layer sits
-// closest to the base — so what reflects back and re-exposes is overwhelmingly
-// red. These weights are a MODELLED DEFAULT of that behaviour on a one-axis
-// R:G:B ratio, NOT a published transmittance curve and NOT any measured stock.
-// (An earlier comment here called them "Beer-Lambert-shaped (published AH
-// behaviour)" with no citation; that was circular and is withdrawn. The honest
-// claim is: the mechanism is published, this ratio is our modelled default, and
-// H3/H4 gate what it is allowed to claim on screen.)
-static const float kHalWeight[3] = { 1.0f, 0.30f, 0.10f };
+// The AH weighting under test is the SHIPPING constant, speakcore::kHalWeight —
+// deliberately not a private copy, so that changing the core's weights re-runs
+// this measurement instead of silently drifting from it. (Its provenance is
+// documented at the constant: the MECHANISM — light reaching the base is already
+// depleted of blue/green by the yellow filter and upper layers, and the red
+// layer sits closest to the base — is published; the {1, 0.30, 0.10} ratio is a
+// MODELLED DEFAULT. An earlier comment here called them "Beer-Lambert-shaped
+// (published AH behaviour)" with no citation, which fitted a made-up ratio and
+// then cited Beer-Lambert for it; withdrawn.)
 static const float kHalThresh = 0.6f;     // linear highlight excess threshold
 static const float kHalSigma  = 9.0f;     // scatter radius (px, prototype)
 
@@ -239,7 +238,7 @@ int main()
     const int W = 220, H = 220;
     SpeakProfile p = neutralProfile();
     const float amount = 1.0f;
-    const float* w = kHalWeight;
+    const float* w = speakcore::kHalWeight;   // the SHIPPING constant
 
     // --- the ceiling is ANALYTIC, not an empirical finding. State it as such. ---
     const float ceiling = toneChannel(1e6f, 0, p);

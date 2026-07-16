@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run algorithm tests
+      - name: Run algorithm tests (Hush)
         run: |
           cd test
           c++ -O2 -std=c++14 -I../plugin test_denoise.cpp -o test_denoise
@@ -23,14 +23,62 @@ jobs:
           # real-clip harness: compile-only (it runs on user footage, not CI)
           c++ -O2 -std=c++14 -I../plugin hush_cli.cpp -o hush_cli
 
-      # the CUDA kernel is a textual port that nothing else compiles until it
-      # reaches NVIDIA hardware — clang's host-only CUDA mode at least
-      # type-checks the whole file (kernel bodies included)
+      # Speak had NO CI coverage at all until 2026-07-16 — its CPU gates, its
+      # control arms and both GPU parity suites only ever ran on a developer's
+      # machine, which is exactly how a regression ships. The control arms are
+      # the project's core discipline; they have to run on every push.
+      - name: Run algorithm tests (Speak)
+        run: |
+          cd test
+          c++ -O2 -std=c++14 -I../plugin test_speak.cpp -o test_speak
+          ./test_speak
+          c++ -O2 -std=c++14 -I../plugin test_speak_macbeth.cpp -o test_speak_macbeth
+          ./test_speak_macbeth
+          c++ -O2 -std=c++14 -I../plugin test_speak_split.cpp -o test_speak_split
+          ./test_speak_split
+          c++ -O2 -std=c++14 -I../plugin proto_halation.cpp -o proto_halation
+          ./proto_halation
+          c++ -O2 -std=c++14 -I../plugin test_speak_metal.mm ../plugin/SpeakMetalKernel.mm \
+              -framework Metal -framework Foundation -o test_speak_metal
+          ./test_speak_metal
+          c++ -O2 -std=c++14 -I../plugin test_speak_opencl.cpp ../plugin/SpeakOpenCLKernel.cpp \
+              -framework OpenCL -o test_speak_opencl
+          ./test_speak_opencl
+          # dev render tool: compile-only (it writes PPMs for eyeballing)
+          c++ -O2 -std=c++14 -I../plugin render_speak.cpp -o render_speak
+
+      # Resolve compiles the kernel sources at plugin load, so a syntax error
+      # would otherwise surface only on a user's machine.
+      - name: Kernel sources compile offline
+        run: |
+          cd test
+          awk '/^static const char\* kKernelSource = R"MSL\(/{flag=1;next} /^\)MSL";/{flag=0} flag' \
+              ../plugin/MetalKernel.mm > /tmp/opennr.metal
+          xcrun -sdk macosx metal -c /tmp/opennr.metal -o /tmp/opennr.air
+          awk '/^static const char\* kSpeakKernelSource = R"MSL\(/{flag=1;next} /^\)MSL";/{flag=0} flag' \
+              ../plugin/SpeakMetalKernel.mm > /tmp/speak.metal
+          xcrun -sdk macosx metal -c /tmp/speak.metal -o /tmp/speak.air
+          c++ -O2 -std=c++14 compile_opencl.cpp -framework OpenCL -o compile_opencl
+          awk '/R"CLC\(/{flag=1;next} /^\)CLC";/{flag=0} flag' \
+              ../plugin/SpeakOpenCLKernel.cpp > /tmp/speak.cl
+          ./compile_opencl /tmp/speak.cl
+
+      # the CUDA kernels are textual ports that nothing else compiles until they
+      # reach NVIDIA hardware — clang's host-only CUDA mode at least
+      # type-checks the whole file (kernel bodies included). Covers BOTH plugins.
       - name: CUDA syntax check (no toolkit)
         run: ./test/check_cuda_syntax.sh
 
       - name: Build plugin (universal)
         run: make -C plugin
+
+      # a describe-time crash is INVISIBLE in Resolve — the plugin silently
+      # never appears — so this must run against the real built .ofx.
+      - name: Describe smoke test
+        run: |
+          cd test
+          c++ -O2 -std=c++14 -I../ofx/include test_describe.cpp -o test_describe
+          ./test_describe ../plugin/OpenNR.ofx.bundle/Contents/MacOS/OpenNR.ofx
 
       - name: Package
         run: ./build_release.sh
