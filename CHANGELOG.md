@@ -15,6 +15,17 @@ pairing with Speak real instead of aspirational.
   the incoming alpha while on, and the hint says so. Off by default, so every
   existing project renders bit-identically.
 - The inspection views keep the true alpha; only the Result view exports.
+- **Signed and notarized — the first release that actually is.** The installer
+  is signed with a Developer ID Installer certificate, notarized by Apple, and
+  stapled; the bundle carries its own stapled ticket. It just opens: no
+  right-click → Open, no "Open Anyway", no `xattr -dr`. The binary is
+  unchanged — same 3.7.0 plugin, same hashes inside — only the wrapper is
+  blessed now. Earlier releases shipped Gatekeeper-rejected because
+  `build_release.sh`'s two guards *failed open*: with no Installer identity and
+  no notary profile stored, it printed a line and shipped anyway while
+  reporting success. Both are now fatal, and the bundle is ticketed before the
+  pkg and zip are built from it — the old order left the zip's payload without
+  a ticket even on a good run.
 
 ## 3.6.0 — 2026-07-16
 

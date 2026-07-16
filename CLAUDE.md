@@ -105,11 +105,24 @@ Version bump checklist (all four places):
 4. `CHANGELOG.md` — new entry (used as GitHub release notes)
 
 Signing: the script auto-detects a "Developer ID Application" identity
-(Stephen's team: 6M536MV7GT) for the bundle, a "Developer ID Installer"
-identity for the pkg (not present yet — pkg ships unsigned), and a notarytool
-keychain profile named `opennr-notary` for notarization (not stored yet; set
-up with `xcrun notarytool store-credentials opennr-notary --apple-id ...
---team-id 6M536MV7GT --password <app-specific password>`).
+(Stephen's team: 6M536MV7GT) for the bundle and a "Developer ID Installer"
+identity for the pkg, and notarizes through the `opennr-notary` keychain
+profile. **All three exist on Stephen's Mac as of 2026-07-16** — 3.7.0 is the
+first release actually signed *and* notarized end to end (`spctl -a -t install`
+→ `accepted  source=Notarized Developer ID`). On a machine without them, set up
+with `xcrun notarytool store-credentials opennr-notary --apple-id ... --team-id
+6M536MV7GT` (it prompts for an app-specific password from appleid.apple.com;
+never put it on the command line).
+
+**Order matters and the script used to get it wrong:** ticket the *bundle*
+first, then build the pkg and the zip from the stapled copy — otherwise the zip
+ships a payload with no ticket even on a successful run, which is why the
+README used to tell people to `xattr -dr`. And never submit an unsigned pkg:
+Apple rejects it, and the error blames the notary profile rather than the
+missing Installer certificate. Both of the old `if identity exists … else skip`
+guards **failed open** — they printed one line and shipped a Gatekeeper-rejected
+package while reporting success. A guard around a release step should fail
+loudly or not exist.
 
 GitHub: repo `amateurmenace/Hush-OpenNR` (renamed from `OpenNR` 2026-07-15 — old
 github.com URLs redirect, but the old Pages URL `github.io/OpenNR/` does
@@ -158,9 +171,12 @@ conversion lines).
 - **Resolve caches OFX scans** in `~/Library/Application Support/Blackmagic
   Design/DaVinci Resolve/OFXPluginCacheV2.xml`. Delete it to force a rescan
   after swapping binaries.
-- **Quarantine**: hand-copied downloaded bundles carry `com.apple.quarantine`
-  and get silently blocked — `sudo xattr -dr com.apple.quarantine <bundle>`.
-  Installer-pkg payloads don't have this problem.
+- **Quarantine**: a downloaded bundle carries `com.apple.quarantine` and gets
+  silently blocked *unless it is notarized and stapled* — which, since 3.7.0,
+  it is. `sudo xattr -dr com.apple.quarantine <bundle>` is the escape hatch for
+  a locally-built bundle Apple has never seen (i.e. every dev build). Never put
+  that instruction back in the README: telling users to disarm Gatekeeper is a
+  thing this project does not do now that it doesn't have to.
 - **Test in Resolve without admin**: launch Resolve with `OFX_PLUGIN_PATH`
   pointing at a directory containing the bundle; Resolve honors it and the
   cache records the scan result (`status="0"` = loaded). Same plugin identifier

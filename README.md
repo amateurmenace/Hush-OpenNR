@@ -147,18 +147,18 @@ HD when enabled, Render Boost ~0.7 ms over the same-settings static row.
 ## Install
 
 ### macOS
-1. Download `OpenNR-3.1.0-macOS.pkg` and double-click it.
-   *(The package is not yet notarized: if macOS blocks it, right-click → Open,
-   or approve it under System Settings → Privacy & Security → "Open Anyway".)*
+1. Download `OpenNR-3.7.0-macOS.pkg` and double-click it. It's signed and
+   notarized by Apple, so it just opens — no right-click, no "Open Anyway", no
+   Terminal.
 2. Restart DaVinci Resolve. If you had a previous OpenNR version, also delete
    Resolve's plugin scan cache so it rescans:
    `rm ~/Library/Application\ Support/Blackmagic\ Design/DaVinci\ Resolve/OFXPluginCacheV2.xml`
 
-Alternative (no installer): unzip `OpenNR-3.1.0-macOS.zip` and double-click
+Alternative (no installer): unzip `OpenNR-3.7.0-macOS.zip` and double-click
 `Install OpenNR (macOS).command`, or copy `OpenNR.ofx.bundle` into
-`/Library/OFX/Plugins/` yourself. If you copy a bundle that was downloaded or
-AirDropped, clear the quarantine flag or macOS will silently refuse to load it:
-`sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/OpenNR.ofx.bundle`
+`/Library/OFX/Plugins/` yourself. The bundle carries a stapled notarization
+ticket, so a copied or AirDropped one loads without clearing any quarantine
+flag.
 
 ### Windows
 Download `OpenNR-x.y.z-Windows.zip` from the latest release, unzip, and either
