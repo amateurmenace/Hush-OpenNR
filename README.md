@@ -34,6 +34,12 @@ edges, fine checker texture and 2-px lines survive.*
   state. One Cmd+Z (or the Revert button) restores everything, a read-only
   Analysis line reports what it measured, and your Step 4 look choices are
   never touched.
+- **Self-tuning Auto Setup (v3.5)** — the class table is only the starting
+  point: the button now test-denoises a centre crop of your actual clip at a
+  3×3 grid of (temporal, spatial) strengths and keeps the statistically best
+  pair, scored by Stein's unbiased risk estimate — a measurement of true
+  denoising error that needs no clean reference. Deterministic, ~3–5 s at
+  button press, and the Analysis line says "· tuned" when it ran.
 - **Automatic noise profiling, done right for video** — three estimators run per
   frame: frame-to-frame differences (immune to the spatially-correlated noise
   that compression and debayering create), plus fine- and coarse-scale spatial
@@ -58,6 +64,21 @@ edges, fine checker texture and 2-px lines survive.*
   walk), so real pans and handheld drift keep their across-frames averaging.
   The hard-knee gate is unchanged — still exactly zero past the knee, still
   ghost-proof — and shifted matches face a steeper gate.
+- **Render Boost (v3.5)** — during sequential playback and exports, the
+  previous frame's temporal result joins the merge as one extra gated
+  candidate, so static areas compound frame over frame — up to about twice
+  the effective frames. The knee actually gets SHARPER against the cleaner
+  history (a diff against an n-frame average has less spread than a
+  frame-pair diff), so the anti-ghosting guarantees hold: a panning test
+  chain is bit-identical to boost-off. Scrubbing, parameter changes and
+  clip edges fall back automatically. Off by default; +1.94 dB on a
+  6-frame static chain for ~1 ms at HD.
+- **Exposure match (v3.5)** — auto-exposure steps, iris pulls and light
+  flicker used to read as motion and knock whole frames out of the stack.
+  Each neighbour now gets a measured global exposure offset before the
+  motion tests, so a matched patch under flicker blends like a static one
+  while the output keeps your frame's exposure. Flicker-free footage is
+  bit-exact with v3.4.
 - **Firefly removal (v3)** — single-frame impulses (hot pixels, sensor
   fireflies) are clipped to the 3-frame temporal median. Three independent
   tests must agree before a pixel is touched, so thin fast-moving detail
@@ -103,21 +124,23 @@ edges, fine checker texture and 2-px lines survive.*
 
 ## Performance
 
-Measured on an Apple M1 Max (`test/bench_metal.mm`), v3.4. The bench feeds
-realistic frames (scene + per-frame noise). Panning costs more than v3.2
-because the motion search genuinely re-aims up to ~8 px — including the
-±2-frame neighbours v3.2 simply gated off; toggle Motion Tracking off for
-the old speed. Lock Profile is also the fast path: with no scopes open, a
-locked profile skips the whole input measurement. The v3.4 brightness-aware
-gate costs ~3–4% (two per-pixel gain lookups in the merge).
+Measured on an Apple M1 Max (`test/bench_metal.mm`), v3.5, best of repeated
+runs. The bench feeds realistic frames (scene + per-frame noise). The
+non-boost paths are byte-identical math to v3.4 (parity-verified) — deltas
+vs the old table are bench-session variance, not code. Panning costs more
+than v3.2 because the motion search genuinely re-aims up to ~8 px; toggle
+Motion Tracking off for the old speed. Lock Profile is also the fast path:
+with no scopes open, a locked profile skips the whole input measurement.
+Render Boost is measured over sequential frames (the export case), history
+valid every frame.
 
-| Resolution | Better (NLM, R3, 5 frames) | Locked profile | Panning footage | 7 Frames | Faster (bilateral, R2, 3 frames) |
-|---|---|---|---|---|---|
-| HD 1920×1080 | 9.7 ms (104 fps) | 7.8 ms (129 fps) | 19.8 ms (51 fps) | 10.6 ms (95 fps) | 5.7 ms (176 fps) |
-| UHD 3840×2160 | 36.7 ms (27 fps) | 30.8 ms (32 fps) | 76.7 ms (13 fps) | 40.0 ms (25 fps) | 21.1 ms (48 fps) |
+| Resolution | Better (NLM, R3, 5 frames) | Locked profile | Panning footage | 7 Frames | Render Boost (sequential) | Faster (bilateral, R2, 3 frames) |
+|---|---|---|---|---|---|---|
+| HD 1920×1080 | 10.2 ms (98 fps) | 8.5 ms (118 fps) | 21.9 ms (46 fps) | 11.4 ms (88 fps) | 11.0 ms (91 fps) | 6.2 ms (162 fps) |
+| UHD 3840×2160 | 38.7 ms (26 fps) | 33.3 ms (30 fps) | 84.2 ms (12 fps) | 42.5 ms (24 fps) | 41.2 ms (24 fps) | 22.4 ms (45 fps) |
 
 Real-time UHD at maximum quality on Apple Silicon; Deep Clean adds ~3 ms at
-HD when enabled.
+HD when enabled, Render Boost ~0.7 ms over the same-settings static row.
 
 ---
 

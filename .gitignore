@@ -17,3 +17,4 @@ test/*.air
 # opencl compile-check harness binary
 test/compile_opencl
 test/test_describe
+out_*.ppm

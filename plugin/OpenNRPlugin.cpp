@@ -61,24 +61,24 @@ static uint32_t boostParamsHash(const NRParams& p)
 #define kPluginName "Hush Open NR"
 #define kPluginGrouping "Hush"
 #define kPluginDescription \
-    "Hush Open NR v3.4 — the free noise reduction suite.\n\n" \
+    "Hush Open NR v3.5 — the free noise reduction suite.\n\n" \
     "Click AUTO SETUP and the plugin measures your clip and dials in every " \
     "slider (one undo reverts) — or CLEAN SLATE to zero everything and work " \
     "fully manually. Work top to bottom: 1 measure, 2 temporal, 3 spatial, " \
     "4 refine, 5 inspect.\n\n" \
-    "New in 3.4: LOCK PROFILE now freezes exactly the measurement you are " \
-    "looking at (playhead frame, confirmed by a tracked sweep of its " \
-    "neighbours — no more noise coming back the moment you lock), AUTO " \
-    "REGION finds the flattest patch and moves the sampling box there for " \
-    "you, the box shows its state (yellow = live, blue padlock = frozen), " \
-    "and the temporal gate is brightness-aware — shadows keep their " \
-    "averaging, highlights gate tighter.\n\n" \
+    "New in 3.5: RENDER BOOST blends against the previous rendered frame " \
+    "too, compounding the averaging on static areas during sequential " \
+    "playback and exports (up to about twice the frames); AUTO SETUP now " \
+    "self-tunes — it test-denoises a crop of your clip at a grid of " \
+    "settings and keeps the statistically best pair; and auto-exposure " \
+    "steps or light flicker no longer knock frames out of the temporal " \
+    "stack (each neighbour is exposure-matched before the motion tests).\n\n" \
     "Each step has a Scope checkbox that draws a panel right in the viewer. " \
     "Turn scopes off before rendering.\n\n" \
     "MIT-licensed and free forever."
 #define kPluginIdentifier "org.opennr.Denoise"
 #define kPluginVersionMajor 3
-#define kPluginVersionMinor 4
+#define kPluginVersionMinor 5
 
 #define kSupportsTiles false
 #define kSupportsMultiResolution false

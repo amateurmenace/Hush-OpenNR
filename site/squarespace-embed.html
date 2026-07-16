@@ -225,7 +225,7 @@
         <a class="btn btn-green" style="background:var(--green-lt)" href="https://github.com/amateurmenace/Hush-OpenNR/releases/latest">Download · Windows</a>
         <a class="btn btn-line" href="https://github.com/amateurmenace/Hush-OpenNR">GitHub</a>
       </div>
-      <div class="meta">v3.4 · Resolve 17+ free &amp; Studio · macOS 11+ (universal) · Windows 10+ x64 (OpenCL) · MIT · Linux builds from source</div>
+      <div class="meta">v3.5 · Resolve 17+ free &amp; Studio · macOS 11+ (universal) · Windows 10+ x64 (OpenCL) · MIT · Linux builds from source</div>
     </div>
 
     <div class="demo reg">
@@ -280,7 +280,7 @@
 
 <section class="alt">
   <div class="wrap">
-    <div class="kicker">v3 → v3.4 · Intelligence, power, transparency</div>
+    <div class="kicker">v3 → v3.5 · Intelligence, power, transparency</div>
     <h2>One click. Every slider, set.</h2>
     <p class="lede"><b>Auto Setup</b> analyzes your clip and dials in the whole
     plugin — then hands you the sliders.</p>
@@ -364,7 +364,8 @@
     v3.1 &nbsp;Detail Rescue, per-step viewer scopes, extended ranges, bolder Auto Setup<br>
     v3.2 &nbsp;Ghost Guard, two-scale residual, lock/region field fixes<br>
     v3.3 &nbsp;±8 px hierarchical motion search, 7-frame stack, Deep Clean, per-channel chroma, lock fast path<br>
-    v3.4 &nbsp;playhead lock + tracked sweep, Auto Region, live/frozen box states, brightness-aware temporal gate</p>
+    v3.4 &nbsp;playhead lock + tracked sweep, Auto Region, live/frozen box states, brightness-aware temporal gate<br>
+    v3.5 &nbsp;Render Boost (sequential renders compound the stack), self-tuning Auto Setup (Monte-Carlo SURE), exposure match</p>
   </div>
 </section>
 
@@ -407,14 +408,14 @@
     precisely known injected noise, so improvement is measured, not eyeballed.</p>
     <div class="chart" id="hush-chart">
       <h3>PSNR before → after (dB, higher is better)</h3>
-      <div class="sub">640×360 validation scenes · σ = 5% · defaults · v3.4</div>
+      <div class="sub">640×360 validation scenes · σ = 5% · defaults · v3.5</div>
       <div class="cbar"><div class="lab"><span>Static shot</span><b>26.0 → 40.9 dB</b></div><div class="track"><div class="before" style="width:52%"></div><div class="after" data-w="82%"></div></div></div>
       <div class="cbar"><div class="lab"><span>Correlated (compressed) noise</span><b>26.0 → 35.4 dB</b></div><div class="track"><div class="before" style="width:52%"></div><div class="after" data-w="71%"></div></div></div>
       <div class="cbar"><div class="lab"><span>Slow drift — motion-tracked in v3</span><b>26.0 → 38.3 dB</b></div><div class="track"><div class="before" style="width:52%"></div><div class="after" data-w="77%"></div></div></div>
       <div class="cbar"><div class="lab"><span>Fast motion</span><b>26.0 → 36.0 dB</b></div><div class="track"><div class="before" style="width:52%"></div><div class="after" data-w="72%"></div></div></div>
       <div class="cbar"><div class="lab"><span>Auto Setup vs defaults (noisy footage, v3.1)</span><b>40.6 → 45.6 dB</b></div><div class="track"><div class="before" style="width:81%"></div><div class="after" data-w="91%"></div></div></div>
     </div>
-    <p class="cap" style="margin-top:10px">Plus: 135 synthetic-truth checks per build (auto must beat defaults on every footage class, ghosting regressions are build failures), GPU output verified against the CPU reference across 51 configurations to ~10⁻⁶ · 104 fps HD / 27 fps UHD max quality on an M1 Max (129 fps HD locked).</p>
+    <p class="cap" style="margin-top:10px">Plus: 146 synthetic-truth checks per build (auto must beat defaults on every footage class, ghosting regressions are build failures), GPU output verified against the CPU reference across 56 configurations to ~10⁻⁶ · 98 fps HD / 26 fps UHD max quality on an M1 Max (118 fps HD locked).</p>
   </div>
 </section>
 
@@ -566,17 +567,17 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
     <h3>Engineering</h3>
     <p>One reference implementation in C++; Metal, CUDA and OpenCL kernels are line-by-line
     ports, and a parity harness drives the actual plugin GPU entry point — the one Resolve
-    calls — asserting agreement with the reference to ~10⁻⁶ across 51 configurations, with
-    135 synthetic-truth checks gating every build (including "Auto Setup must beat stock
+    calls — asserting agreement with the reference to ~10⁻⁶ across 56 configurations, with
+    146 synthetic-truth checks gating every build (including "Auto Setup must beat stock
     defaults on every footage class", a slow-drift no-ghosting regression, and v3.4's
     tracked-sweep suite: the tracker must recover planted shifts, stay put on featureless
     patches, and reject an occlusion crossing the sampling region). Even the film grain is
     bit-deterministic (integer-hash value noise). Honest limitations: no motion-vector
     compensation and no neural net — that's what keeps it fast, predictable, and free.</p>
     <table>
-      <tr><th>Resolution</th><th>Best quality (NLM r3 · 5 frames · blotch)</th><th>Locked profile</th><th>Faster mode</th></tr>
-      <tr><td>HD 1920×1080</td><td>9.7 ms/frame — 104 fps</td><td>7.8 ms — 129 fps</td><td>5.7 ms — 176 fps</td></tr>
-      <tr><td>UHD 3840×2160</td><td>37 ms/frame — 27 fps</td><td>31 ms — 32 fps</td><td>21 ms — 48 fps</td></tr>
+      <tr><th>Resolution</th><th>Best quality (NLM r3 · 5 frames · blotch)</th><th>Locked profile</th><th>Render Boost (sequential)</th><th>Faster mode</th></tr>
+      <tr><td>HD 1920×1080</td><td>10.2 ms/frame — 98 fps</td><td>8.5 ms — 118 fps</td><td>11.0 ms — 91 fps</td><td>6.2 ms — 162 fps</td></tr>
+      <tr><td>UHD 3840×2160</td><td>39 ms/frame — 26 fps</td><td>33 ms — 30 fps</td><td>41 ms — 24 fps</td><td>22 ms — 45 fps</td></tr>
     </table>
   </div>
 </section>

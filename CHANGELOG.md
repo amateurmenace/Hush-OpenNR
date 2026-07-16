@@ -1,5 +1,75 @@
 # OpenNR changelog
 
+## 3.5.0 — 2026-07-15
+
+The compounding release: sequential renders now stack up past the frame
+window, Auto Setup measures its own answers instead of trusting a table,
+and auto-exposure wobble stops knocking frames out of the temporal stack.
+
+### Added
+- **Render Boost** (Step 2, off by default). The previous frame's TRUE
+  temporal result joins the merge as one extra gated candidate, so static
+  areas compound frame over frame during sequential playback and exports —
+  up to about twice the effective frames (cap 12). The history is
+  calibrated for what it is: a diff against an n-frame average has
+  sigma·sqrt(1+1/n), not sqrt(2)·sigma, so its knee START and span tighten
+  by sqrt((1+1/n)/2) — coherent-change detection gets SHARPER against the
+  cleaner reference, not looser. Its gate applies QUADRATICALLY (a 60%
+  match keeps 36%, it does not drag 12× harder — linear gating smeared a
+  panning chain −0.21 dB; quadratic returns it to exactly the boost-off
+  number), Ghost Guard gates its signed mean, and the previous frame's
+  exposure offset applies to its luma. Hosts on all four backends cache
+  the buffer per queue/stream and only declare it valid when the previous
+  committed render was frame−1 at the same size with the same params hash:
+  scrubbing, parameter changes, resizes, clip edges and reverse renders
+  all fall back to the plain stack bit-exactly. Measured: a 6-frame static
+  chain goes 40.93 → 42.87 dB (+1.94, effN 4.7 → 8.9); a panning chain is
+  bit-identical to boost-off; +1.1 ms at HD.
+- **Self-tuning Auto Setup.** The class table is a good prior — now it is
+  only the prior. Auto Setup runs a Monte-Carlo SURE sweep (Stein's
+  unbiased risk estimate, luma-only, deterministic fixed-seed Rademacher
+  probes) of the FULL pipeline on a centre crop of the real 7-frame stack
+  at the playhead: a 3×3 grid of (temporal luma, spatial luma) at ±25%
+  around the table values, 18 crop denoises, ~3–5 s at button press. The
+  statistically best pair overwrites those two sliders and the Analysis
+  line gains "· tuned". On the synthetic suite the SURE argmin lands
+  exactly on the true-MSE argmin; any fetch hiccup falls back to the
+  table silently.
+
+### Fixed
+- **Exposure match** — auto-exposure steps, iris pulls and light flicker
+  no longer gate the temporal stack out. Each neighbour frame gets a
+  global exposure offset (median of signed luma diffs, 128-bin histogram,
+  deadzone snaps to exactly zero so flicker-free footage is BIT-EXACT
+  with 3.4), subtracted in every patch diff, the Ghost-Guard signed mean,
+  the coarse search metric, the zapper's cross-frame tests and the
+  blended sample. A +3% step at sigma 1.5% used to cost 2.38 dB; it now
+  recovers to 50.93 dB against a 50.96 clean ceiling. Costs ~0.4 ms at
+  HD, runs under the lock fast path and manual profiles too.
+
+### Evaluated and rejected (recorded so the ideas stay dead)
+- **Jensen mean-bound NLM pruning** (skip patch loops the mean already
+  rules out): the bound never bites on texture and the bookkeeping costs
+  2% net on M1 on flat AND textured bench scenes. Dead.
+- **Ring-convergence early exit** (stop the NLM ring walk when a ring
+  contributes nothing): −0.066 dB at R8 against a 0.02 dB budget. Dead.
+- **Sub-pixel winner refinement** (parabola/bilinear refinement of the
+  shift-search winner): a noise-level wash even with noise-fair selection
+  scaled by sqrt(2/(1+s²)) — the hard knee already absorbs fractional
+  misalignment — and unnormalized it LOSES 0.04 dB because bilinear
+  smoothing biases the selection. Naive parabola sub-pel on |diff|
+  profiles is biased ~t/2 by construction. Dead.
+- **Multi-frame detail recovery** (super-resolution-style phase-aware
+  accumulation): killed at the ceiling gate BEFORE building estimation.
+  With GROUND-TRUTH half-pixel offsets on a 2×-truth synthetic, the raw
+  +3.2 dB win over the merge vs an alias-free reference turned out to be
+  reference-kernel mismatch: a plain 3×3 post-blur of the current merge
+  beats the phase-aware accumulator by 1.91 dB at sigma 0 (the true
+  phase-information gain is NEGATIVE), the sigma>0 deltas are 63-sample
+  noise averaging that Render Boost already provides without resampling,
+  and against the clip's native rendering the accumulator loses 3.75 dB
+  at sigma 2%. Dead — and offset estimation was never built.
+
 ## 3.4.0 — 2026-07-15
 
 The lock release: Lock Profile now freezes exactly the measurement you are
