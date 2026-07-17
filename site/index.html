@@ -60,14 +60,18 @@
   .hero h1 .dot { color: var(--amber); }
   .hero h1.speak-title { color: var(--speak); margin-top: 2px; }
   .hero h1.speak-title .dot { color: var(--speak-br); }
-  .hero .amp { display: block; font: 600 20px var(--mono); color: var(--text-lt); letter-spacing: .1em; margin: 6px 0 4px; text-transform: uppercase; }
+  /* the slash between the two names — one thin diagonal, night into day */
+  .hero .slash { display: block; width: 170px; height: 5px; border-radius: 3px;
+    background: linear-gradient(90deg, var(--green-br), var(--amber) 45%, var(--speak));
+    transform: rotate(-4deg); transform-origin: left center;
+    margin: 20px 0 16px 6px; }
   .famline { font: 600 12.5px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--text-lt); margin-bottom: 14px; }
   .famline a { color: var(--green-br); text-decoration: none; border-bottom: 1px solid var(--sage); }
   .famline a:hover { color: var(--green); }
   .famline b { color: var(--speak); font-weight: 700; }
   .btn-speak { background: var(--speak); color: var(--cream); box-shadow: 0 4px 14px rgba(192,96,58,.25); }
   .btn-speak:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(192,96,58,.32); }
-  .hero .tag { font: 500 15px var(--mono); color: var(--green-br); margin: 4px 0 16px; letter-spacing: .06em; }
+  .hero .tag { font: 500 14px var(--mono); color: var(--green-br); margin: 18px 0 16px; letter-spacing: .06em; }
   .hero p.lead { font-size: 19px; color: var(--text-med); max-width: 46ch; }
   .squiggle { display: block; margin: 18px 0 26px; }
   .cta { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
@@ -381,9 +385,9 @@
     <div>
       <div class="famline">Part of the <a href="https://control-z.org">control&#8209;z</a> family of free tools — <b>undo the paywall</b></div>
       <h1>Hush<span class="dot">.</span></h1>
-      <span class="amp">&amp; also</span>
+      <span class="slash" aria-hidden="true"></span>
       <h1 class="speak-title">Speak<span class="dot">.</span></h1>
-      <div class="tag">OPEN NR + FILM EMULATION · FOR DAVINCI RESOLVE</div>
+      <div class="tag">OPEN SOURCE NOISE REDUCTION + FILM EMULATION · FOR DAVINCI RESOLVE</div>
       <p class="lead">Two free, open-source OpenFX plugins that turn the <b>free</b> edition of Resolve
       into a finishing room. <b>Hush</b> opens the node tree and takes the noise out — measured, and it
       shows every move. <b>Speak</b> closes the tree and gives the image its voice — real film color,
