@@ -31,6 +31,9 @@
     --amber: #E5A835;
     --amber-bg: #FEF6E6;
     --orange: #E89D6B;
+    --speak: #C0603A;        /* Speak's warm terracotta — the day to Hush's night */
+    --speak-br: #D07A4E;
+    --speak-bg: #FBEDE4;
     --dark: #2D3A2E;
     --r-sm: 8px; --r-md: 12px; --r-lg: 20px;
     --mono: "SF Mono", ui-monospace, Menlo, monospace;
@@ -60,6 +63,15 @@
   @media (max-width: 860px) {#hush-embed .hero { grid-template-columns: 1fr; }
  }#hush-embed .hero h1 { font-size: clamp(52px, 8vw, 88px); line-height: .95; letter-spacing: -0.03em; color: var(--green); }
 #hush-embed .hero h1 .dot { color: var(--amber); }
+#hush-embed .hero h1.speak-title { color: var(--speak); margin-top: 2px; }
+#hush-embed .hero h1.speak-title .dot { color: var(--speak-br); }
+#hush-embed .hero .amp { display: block; font: 600 20px var(--mono); color: var(--text-lt); letter-spacing: .1em; margin: 6px 0 4px; text-transform: uppercase; }
+#hush-embed .famline { font: 600 12.5px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--text-lt); margin-bottom: 14px; }
+#hush-embed .famline a { color: var(--green-br); text-decoration: none; border-bottom: 1px solid var(--sage); }
+#hush-embed .famline a:hover { color: var(--green); }
+#hush-embed .famline b { color: var(--speak); font-weight: 700; }
+#hush-embed .btn-speak { background: var(--speak); color: var(--cream); box-shadow: 0 4px 14px rgba(192,96,58,.25); }
+#hush-embed .btn-speak:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(192,96,58,.32); }
 #hush-embed .hero .tag { font: 500 15px var(--mono); color: var(--green-br); margin: 4px 0 16px; letter-spacing: .06em; }
 #hush-embed .hero p.lead { font-size: 19px; color: var(--text-med); max-width: 46ch; }
 #hush-embed .squiggle { display: block; margin: 18px 0 26px; }
@@ -316,7 +328,47 @@
 #hush-embed .nt-detail .dt { font: 700 11px var(--mono); letter-spacing: .12em; text-transform: uppercase; margin-bottom: 5px; color: #e6e6ee; }
 
   @media (prefers-reduced-motion: reduce) {#hush-embed .wire i { display: none; }
- }#hush-embed footer { padding: 54px 0 70px; }
+ }#hush-embed /* ---------- the ballet: how Hush + Speak complete each other ---------- */
+  .ballet { padding: 64px 0; }
+#hush-embed .ballet .duo { display: grid; grid-template-columns: 1fr auto 1fr; gap: 0; align-items: stretch; margin-top: 30px; border-radius: var(--r-lg); overflow: hidden; border: 1px solid var(--border); }
+
+  @media (max-width: 760px) {#hush-embed .ballet .duo { grid-template-columns: 1fr; }
+ }#hush-embed .ballet .side { padding: 28px 26px; }
+#hush-embed .ballet .side.hush { background: #EEF3EF; }
+#hush-embed .ballet .side.speak { background: var(--speak-bg); }
+#hush-embed .ballet .side .role { font: 700 10.5px var(--mono); letter-spacing: .16em; text-transform: uppercase; }
+#hush-embed .ballet .side.hush .role { color: var(--green-br); }
+#hush-embed .ballet .side.speak .role { color: var(--speak); }
+#hush-embed .ballet .side h3 { font-size: 30px; margin: 4px 0 10px; }
+#hush-embed .ballet .side.hush h3 { color: var(--green); }
+#hush-embed .ballet .side.speak h3 { color: var(--speak); }
+#hush-embed .ballet .side p { font-size: 15px; color: var(--text-med); }
+#hush-embed .ballet .side ul { list-style: none; margin: 12px 0 0; font-size: 14.5px; color: var(--text-med); }
+#hush-embed .ballet .side li { padding: 4px 0 4px 20px; position: relative; }
+#hush-embed .ballet .side li::before { content: "→"; position: absolute; left: 0; }
+#hush-embed .ballet .side.hush li::before { color: var(--green-br); }
+#hush-embed .ballet .side.speak li::before { color: var(--speak-br); }
+#hush-embed .ballet .seam { display: flex; align-items: center; justify-content: center; background: linear-gradient(180deg,#EEF3EF,var(--speak-bg)); padding: 0 8px; }
+#hush-embed .ballet .seam span { font: 700 13px var(--mono); color: var(--text-lt); writing-mode: vertical-rl; letter-spacing: .18em; text-transform: uppercase; }
+
+  @media (max-width: 760px) {#hush-embed .ballet .seam span { writing-mode: horizontal-tb; padding: 12px 0; }
+ }#hush-embed .ballet .handoff { margin-top: 26px; background: var(--amber-bg); border: 1px solid #F0DFB0; border-radius: var(--r-md); padding: 20px 24px; }
+#hush-embed .ballet .handoff b { color: var(--green); }
+#hush-embed .ballet .handoff .h-t { font: 700 10.5px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--amber); margin-bottom: 6px; }
+#hush-embed /* ---------- control-z family band ---------- */
+  section.family { background: var(--dark); color: var(--sage-lt); padding: 60px 0; }
+#hush-embed section.family .kicker { color: var(--amber); }
+#hush-embed section.family h2 { color: #fff; font-size: clamp(28px,4vw,40px); letter-spacing: -0.02em; }
+#hush-embed section.family .lede { color: var(--sage-lt); max-width: 64ch; margin-top: 12px; font-size: 17px; }
+#hush-embed section.family .fam-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap: 12px; margin: 26px 0 24px; }
+#hush-embed section.family .fam-item { background: #22262a; border: 1px solid #343a3f; border-radius: var(--r-md); padding: 14px 16px; }
+#hush-embed section.family .fam-item b { color: #fff; font: 700 15px "Space Grotesk",sans-serif; display: block; }
+#hush-embed section.family .fam-item span { font-size: 13px; color: var(--sage); }
+#hush-embed section.family .fam-item.here { border-color: var(--speak); }
+#hush-embed section.family .fam-cta { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+#hush-embed section.family .btn-cz { background: var(--amber); color: var(--dark); }
+#hush-embed section.family .btn-cz:hover { transform: translateY(-2px); }
+#hush-embed footer { padding: 54px 0 70px; }
 #hush-embed footer .credit { font-family: "Space Grotesk"; font-size: 19px; color: var(--green); }
 #hush-embed footer .credit a { color: var(--green); }
 #hush-embed footer .credit2 { font-size: 15.5px; color: var(--text-med); margin-top: 6px; }
@@ -336,22 +388,26 @@
 
   <div class="hero">
     <div>
+      <div class="famline">Part of the <a href="https://control-z.org">control&#8209;z</a> family of free tools — <b>undo the paywall</b></div>
       <h1>Hush<span class="dot">.</span></h1>
-      <div class="tag">OPEN NR · FOR DAVINCI RESOLVE</div>
-      <p class="lead">Free, open-source noise reduction that works in the <b>free</b> version of
-      Resolve — and gives you insight and control into every move it makes.
-      Shoot in RAW or log without noise anxiety or being forced to pay.
-      New in v3: it sets itself up.</p>
+      <span class="amp">&amp; also</span>
+      <h1 class="speak-title">Speak<span class="dot">.</span></h1>
+      <div class="tag">OPEN NR + FILM EMULATION · FOR DAVINCI RESOLVE</div>
+      <p class="lead">Two free, open-source OpenFX plugins that turn the <b>free</b> edition of Resolve
+      into a finishing room. <b>Hush</b> opens the node tree and takes the noise out — measured, and it
+      shows every move. <b>Speak</b> closes the tree and gives the image its voice — real film color,
+      halation and grain. Clean early, reconstruct late. Shoot RAW or log without noise anxiety, or being
+      forced to pay.</p>
       <svg class="squiggle" width="180" height="14" viewBox="0 0 180 14" fill="none">
         <path d="M2 8 Q 12 2, 22 8 T 42 8 T 62 8 T 82 8 T 102 8 T 122 8 T 142 8 T 162 8 T 178 8" stroke="#E5A835" stroke-width="3" stroke-linecap="round"/>
       </svg>
       <div class="cta">
-        <a class="btn btn-green" href="https://github.com/amateurmenace/Hush-OpenNR/releases/latest">Download · macOS</a>
-        <a class="btn btn-green" style="background:var(--green-lt)" href="https://github.com/amateurmenace/Hush-OpenNR/releases/latest">Download · Windows</a>
-        <a class="btn btn-line" href="https://github.com/amateurmenace/Hush-OpenNR">GitHub</a>
+        <a class="btn btn-green" href="https://github.com/amateurmenace/Hush-OpenNR/releases/latest">Download Hush</a>
+        <a class="btn btn-speak" href="https://github.com/amateurmenace/Speak/releases/latest">Download Speak</a>
+        <a class="btn btn-line" href="#speak">Meet Speak ↓</a>
         <a class="btn btn-line" style="border-color:var(--amber);color:var(--green)" href="https://amateurmenace.github.io/Hush-OpenNR/whitepaper.html" target="_blank" rel="noopener">Design Study White Paper ↗</a>
       </div>
-      <div class="meta">v3.5 · Resolve 17+ free &amp; Studio · macOS 11+ (universal) · Windows 10+ x64 (OpenCL) · MIT · Linux builds from source</div>
+      <div class="meta">Hush v3.5 · Speak v1.0 · Resolve 17+ free &amp; Studio · macOS 11+ · Windows 10+ · MIT · Linux builds from source</div>
     </div>
 
     <div class="demo reg">
@@ -793,11 +849,16 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
   </div>
 </section>
 
-<section class="dark">
+<section class="dark" id="speak">
   <div class="wrap">
-    <div class="kicker" style="color:var(--orange)">The next tool · early beta — <a href="https://github.com/amateurmenace/control-z/releases" target="_blank" rel="noopener" style="color:var(--orange)">download v0.2</a></div>
-    <h2>Meet Speak.</h2>
-    <p class="lede" style="max-width:62ch"><b style="color:#fff">Hush quiets the noise. Speak gives the image its voice.</b> A free film-emulation tool for the <em>end</em> of your node tree — film-stock character, split toning, subtractive saturation, halation and grain. It works in DaVinci Wide Gamut (some steps in linear light), so Resolve Color Management delivers Rec.709, P3 or HDR from a single look.</p>
+    <div class="kicker" style="color:var(--speak-br)">The other half · free &amp; open-source · v1.0</div>
+    <h2>Meet <span style="color:var(--speak-br)">Speak.</span></h2>
+    <p class="lede" style="max-width:62ch"><b style="color:#fff">Hush quiets the noise. Speak gives the image its voice.</b> A free film-emulation plugin for the <em>end</em> of your node tree — film-stock character, split toning, subtractive saturation, halation and grain. It works in DaVinci Wide Gamut (some steps in linear light), so Resolve Color Management delivers Rec.709, P3 or HDR from a single look. Where Hush is the safety net, Speak is the signature.</p>
+    <div class="cta" style="margin:22px 0 6px">
+      <a class="btn btn-speak" href="https://github.com/amateurmenace/Speak/releases/latest">Download Speak · latest release</a>
+      <a class="btn btn-line" style="border-color:var(--speak-br);color:#fff" href="https://github.com/amateurmenace/Speak">Speak on GitHub ↗</a>
+    </div>
+    <div class="meta" style="color:var(--sage);margin-bottom:8px">v1.0 · macOS (Metal) · Windows/Linux (OpenCL) · MIT · reads Hush's clean-confidence matte</div>
 
     <div class="ntree" role="group" aria-label="Sample node tree">
       <div class="flow">
@@ -837,7 +898,54 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
         <b style="color:#e6e6ee">Halation and grain, shipped. Bloom and gate weave, next.</b>
         <p style="color:#a9a9b8">Halation re-exposes the negative before the curve — so a blown highlight blooms white-hot, and a blue neon halates blue, never a pasted red overlay. Grain is density noise per dye layer: loud in the shadows, gone at paper white, boiling every frame — and it reads Hush's clean-confidence matte to land exactly where the denoiser cleaned. Bloom and gate weave follow behind the same measurement gates.</p></div>
     </div>
-    <p style="color:var(--sage);font-size:15px;margin-top:22px">A free rival to paid film tools like Dehancer and Film Look Creator — built from original color science, working in the free version of Resolve, and it shows its work. <a href="https://amateurmenace.github.io/Hush-OpenNR/whitepaper.html" target="_blank" rel="noopener" style="color:var(--orange)">Read the approach →</a></p>
+    <p style="color:var(--sage);font-size:15px;margin-top:22px">A free rival to paid film tools like Dehancer and Film Look Creator — built from original color science, working in the free version of Resolve, and it shows its work. <a href="https://amateurmenace.github.io/Hush-OpenNR/whitepaper.html" target="_blank" rel="noopener" style="color:var(--speak-br)">Read the approach →</a></p>
+  </div>
+</section>
+
+<section class="ballet">
+  <div class="wrap">
+    <div class="kicker">Two tools, one idea</div>
+    <h2 class="intro-h">The ballet: clean early, reconstruct late.</h2>
+    <p class="lede" style="max-width:66ch">Hush and Speak are the two ends of the same node tree — and they were built to
+    dance. One takes noise <em>out</em> at the top, before the grade can amplify it. The other puts optical
+    character <em>back</em> at the bottom, after the grade is done. Between them, your creative work sits on a
+    clean signal and ships wearing real film. Neither needs the other to be useful — but together they're a
+    complete finishing pipeline that used to cost hundreds of dollars and a Studio license.</p>
+
+    <div class="duo">
+      <div class="side hush">
+        <div class="role">First node · the safety net</div>
+        <h3>Hush opens the tree</h3>
+        <p>Measures the clip, removes the noise while it can still see the neighbour frames, and hands your
+        grade a clean signal to build on.</p>
+        <ul>
+          <li>Denoise before contrast and keys amplify it</li>
+          <li>Rebuilds acutance and grain it had to smooth</li>
+          <li>Exports a <b>clean-confidence matte</b> — a map of where it worked hardest</li>
+        </ul>
+      </div>
+      <div class="seam"><span>the handoff</span></div>
+      <div class="side speak">
+        <div class="role">Last node · the signature</div>
+        <h3>Speak closes it</h3>
+        <p>Takes the graded image and gives it a voice — film-stock density, subtractive color, halation and
+        grain, built from real color science.</p>
+        <ul>
+          <li>Film character after the creative grade is locked</li>
+          <li><b>Reads Hush's matte</b> to lay grain exactly where the image was cleaned most</li>
+          <li>One look in wide gamut → Rec.709, P3 or HDR</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="handoff">
+      <div class="h-t">Why the handoff matters</div>
+      <p style="font-size:15.5px;color:var(--text-med)">Denoising and re-graining are usually strangers — you
+      smooth at the start and sprinkle grain at the end, hoping they meet. Because Speak reads the exact matte
+      Hush wrote, <b>grain lands heaviest precisely where the denoiser cleaned deepest</b> — the shadows and
+      flat skies that lost their texture get it back, and the areas that were always sharp stay sharp. Clean
+      early, reconstruct late, and let the two tools compare notes in the middle.</p>
+    </div>
   </div>
 </section>
 
@@ -879,6 +987,30 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
   </div>
 </section>
 
+<section class="family">
+  <div class="wrap">
+    <div class="kicker">The bigger project</div>
+    <h2>Part of control&#8209;z — undo the paywall.</h2>
+    <p class="lede">Hush and Speak are two of a growing family of free, open-source tools built on one belief:
+    the best free video editor in the world, <a href="https://control-z.org" style="color:var(--amber)">DaVinci
+    Resolve</a>, shouldn't leave amateurs stranded at the features a Studio license or an expensive plugin
+    locks away. <b style="color:#fff">control&#8209;z</b> is the toolkit that closes those gaps — cleanup, prep,
+    finishing and delivery — so whether you're an aspiring filmmaker, a journalist, an advocate, an artist, or
+    just someone who wants the form of the work to match what it says, the tools are there and they're free.</p>
+    <div class="fam-grid">
+      <div class="fam-item here"><b>Hush + Speak</b><span>denoise &amp; film emulation — you're here</span></div>
+      <div class="fam-item"><b>Community Highlighter</b><span>long meetings → highlight reels</span></div>
+      <div class="fam-item"><b>Scribe</b><span>local transcripts &amp; captions</span></div>
+      <div class="fam-item"><b>Clear · Rise · Depth</b><span>rescue, upscale, depth mattes</span></div>
+      <div class="fam-item"><b>+ more</b><span>an evolving suite</span></div>
+    </div>
+    <div class="fam-cta">
+      <a class="btn btn-cz" href="https://control-z.org">Explore control&#8209;z.org →</a>
+      <span style="font:500 13.5px var(--mono);color:var(--sage)">free forever · local-first · shows its work</span>
+    </div>
+  </div>
+</section>
+
 <footer>
   <div class="wrap reg">
     <div class="bars" style="margin-bottom:28px"><span style="background:#3D5A47"></span><span style="background:#5B8C65"></span><span style="background:#A3C0B0"></span><span style="background:#E5A835"></span><span style="background:#E89D6B"></span><span style="background:#C5D6CC"></span><span style="background:#2D3A2E"></span></div>
@@ -887,7 +1019,8 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
     made in partnership with <a href="https://brooklineinteractive.org">Brookline Interactive Group</a>.</p>
     <a href="https://weirdmachine.org"><img class="wmlogo" src="https://control-z.org/assets/wm-logo.png" alt="Weird Machine"></a>
     <p>MIT licensed — free for any use, forever. Source, issues and releases on
-    <a href="https://github.com/amateurmenace/Hush-OpenNR">GitHub</a>.</p>
+    <a href="https://github.com/amateurmenace/Hush-OpenNR">GitHub</a>. Part of the
+    <a href="https://control-z.org">control&#8209;z</a> family — Hush + Speak, together.</p>
   </div>
 </footer>
 
